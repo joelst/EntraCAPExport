@@ -39,7 +39,7 @@ Two scripts are provided:
 
 ## Screenshots — sample data only
 
-These captures show version 3.6 using **Contoso Demo (sample data)**. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
+These captures show version 3.7 using **Contoso Demo (sample data)**. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
 
 The sample policies illustrate report behavior, **not a recommended production baseline**. Both light and dark themes are shown.
 
