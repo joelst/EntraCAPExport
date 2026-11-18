@@ -1023,6 +1023,55 @@ Describe 'Offline recommendation exports' {
         @(Get-Content $json.FullName -Raw | ConvertFrom-Json).Count | Should -Be 3
     }
 
+    It 'Derives Summary authentication counts from verified metadata for <Scenario>' -TestCases @(
+        @{ Scenario = 'a misleading custom name'; Strength = @{ id = 'unverified'; displayName = 'Phishing-resistant MFA' }; Mfa = 0 }
+        @{ Scenario = 'an unnamed built-in resistant strength'; Strength = @{ id = '00000000-0000-0000-0000-000000000004' }; Mfa = 1; Phishing = 1 }
+        @{ Scenario = 'a renamed verified custom strength'; Strength = @{ id = 'verified'; displayName = 'Custom sign-in'; allowedCombinations = @('fido2') }; Mfa = 1; Phishing = 1 }
+        @{ Scenario = 'unnamed ordinary custom MFA'; Strength = @{ id = 'ordinary'; allowedCombinations = @('password,sms') }; Mfa = 1 }
+        @{ Scenario = 'an unnamed built-in MFA strength'; Strength = @{ id = '00000000-0000-0000-0000-000000000002' }; Mfa = 1 }
+        @{ Scenario = 'explicit MFA with an empty SDK strength'; Strength = @{ Id = $null; DisplayName = $null; AllowedCombinations = @() }; BuiltIn = @('mfa'); Mfa = 1; StrengthCount = 0 }
+        @{ Scenario = 'a policy without MFA or strength'; BuiltIn = @('compliantDevice'); Mfa = 0; StrengthCount = 0 }
+        @{ Scenario = 'an unnamed cached custom strength'; Strength = @{ id = 'cached' }; CachedStrength = @{ id = 'cached'; allowedCombinations = @('fido2') }; Mfa = 1; Phishing = 1 }
+        @{ Scenario = 'a misleading single-factor name without recommendations'; Strength = @{ id = 'single-factor'; displayName = 'MFA'; allowedCombinations = @('sms') }; Mfa = 0; NoRecommendations = $true }
+    ) {
+        param($Scenario, $Strength, $Mfa, $Phishing = 0, $StrengthCount = 1, $BuiltIn = @(), $CachedStrength, $NoRecommendations = $false)
+        $testPolicy = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $roleId = '62e90394-69f5-4237-9190-012177145e10'
+        $testPolicy.conditions.users.includeRoles = @($roleId)
+        $testPolicy.grantControls = @{ operator = 'OR'; builtInControls = $BuiltIn }
+        if ($Strength) { $testPolicy.grantControls.authenticationStrength = $Strength }
+        $snapshot = New-TestPortableSnapshot -Policies @($testPolicy)
+        $snapshot.Lookups.Roles[$roleId] = 'Global Administrator'
+        if ($CachedStrength) { $snapshot.AuthenticationStrengths = @($CachedStrength) }
+        $inputPath = Join-Path $TestDrive "summary-$Scenario.json"
+        $snapshot | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $inputPath
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive "summary-$Scenario")
+
+        & $exportScript -RawInputFile $inputPath -OutputPath $out.FullName -Html -NoBrowser -NoRecommendations:$NoRecommendations
+
+        $html = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
+        $counts = @{
+            'Policies Requiring MFA (any)' = $Mfa
+            'Policies With Auth Strength' = $StrengthCount
+            'Phishing-resistant Strength' = $Phishing
+            'Policies Targeting Admin Roles' = 1
+            'Admin Policies Requiring MFA' = $Mfa
+            'Admin Policies Phish-Resistant' = $Phishing
+        }
+        foreach ($metric in $counts.GetEnumerator()) {
+            $label = [regex]::Escape($metric.Key)
+            $row = [regex]::Match($html, "<th scope='row'>$label</th><td class='summary-value'><span class='summary-number'>(\d+)</span>")
+            $row.Success | Should -BeTrue -Because "the Summary must include $($metric.Key)"
+            [int]$row.Groups[1].Value | Should -Be $metric.Value -Because "$($metric.Key) must use verified raw metadata"
+        }
+        if (-not $NoRecommendations) {
+            if ($Mfa) { $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-01'" }
+            else { $html | Should -Not -Match "data-assessment='enforced'[^>]*id='rec-CA-01'" }
+            if ($Phishing) { $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-05'" }
+            else { $html | Should -Not -Match "data-assessment='enforced'[^>]*id='rec-CA-05'" }
+        }
+    }
+
     It 'Preserves NoRecommendations mode without recommendation cards or a recommendations tab' {
         $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'no-recommendations')
         & $exportScript -RawInputFile $rawPath -OutputPath $out.FullName -Html -NoRecommendations -NoBrowser
@@ -1438,15 +1487,14 @@ Describe 'Test-IsPhishResistantStrength' {
 Describe 'CA Check Functions Representative Tests' {
     Context 'CA-04 Require MFA for Admins' {
         BeforeAll {
-            function Test-PolicyTargetsAdminRoles { param($Policy) if (-not $Policy -or -not $Policy.Conditions.Users.IncludeRoles) { return $false }; return ($Policy.Conditions.Users.IncludeRoles.Count -gt 0) }
-            function Test-PolicyRequiresMfaForAdmins { param($Policy)
-                if (-not (Test-PolicyTargetsAdminRoles -Policy $Policy)) { return $false }
-                $strengthName = ''
-                if ($Policy.GrantControls.AuthenticationStrength.DisplayName) { $strengthName = [string]$Policy.GrantControls.AuthenticationStrength.DisplayName }
-                $l = $strengthName.ToLowerInvariant()
-                $hasImpliedMfa = ($Policy.GrantControls.BuiltInControls -contains 'Mfa') -or ($l -match 'phishing') -or ($l -match 'passwordless') -or ($l -match 'multifactor') -or ($l -match '\bmfa\b')
-                return $hasImpliedMfa
-            }
+            $source = Get-Content -LiteralPath "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1" -Raw
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
+            $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+            }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+            $script:OfflineMode = $true
+            $script:RoleMap = @{ '62e90394-69f5-4237-9190-012177145e10' = 'Global Administrator' }
         }
         It 'Returns False when policy does not target admin roles' {
             $policy = [pscustomobject]@{

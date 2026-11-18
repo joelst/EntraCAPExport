@@ -893,11 +893,7 @@ function Test-IsPhishResistantStrength {
 function Test-PolicyRequiresMfaForAdmins {
   param($Policy)
   if (-not (Test-PolicyTargetsAdminRoles -Policy $Policy)) { return $false }
-  $strengthName = ''
-  if ($Policy.GrantControls.AuthenticationStrength.DisplayName) { $strengthName = [string]$Policy.GrantControls.AuthenticationStrength.DisplayName }
-  $l = $strengthName.ToLowerInvariant()
-  $hasImpliedMfa = ($Policy.GrantControls.BuiltInControls -contains 'Mfa') -or ($l -match 'phishing') -or ($l -match 'passwordless') -or ($l -match 'multifactor') -or ($l -match '\bmfa\b')
-  return $hasImpliedMfa 
+  return (@(Get-CaProperty $Policy 'grantControls.builtInControls') -contains 'mfa' -or (Test-CaMfaStrength -Policy $Policy))
 }
 
 function Test-PolicyRequiresPhishResistantMfaForAdmins {
@@ -2465,13 +2461,13 @@ if ($HTMLExport) {
   $enabledCount = ($CAPolicy | Where-Object { $_.State -eq 'enabled' }).Count
   $reportOnly = ($CAPolicy | Where-Object { $_.State -eq 'enabledForReportingButNotEnforced' }).Count
   $disabledCount = ($CAPolicy | Where-Object { $_.State -eq 'disabled' }).Count
-  $withMfa = ($CAExport | Where-Object { $_.'Require MFA' -eq 'True' -or $_.'Authentication Strength MFA' }).Count
-  $withStrength = ($CAExport | Where-Object { $null -ne $_.'Authentication Strength MFA' -and $_.'Authentication Strength MFA' -ne '' }).Count
+  $withMfa = @($CAPolicy | Where-Object { @(Get-CaProperty $_ 'grantControls.builtInControls') -contains 'mfa' -or (Test-CaMfaStrength -Policy $_) }).Count
+  $withStrength = @($CAPolicy | Where-Object { Test-CaConfiguredValue (Get-CaProperty $_ 'grantControls.authenticationStrength') }).Count
   $withBlock = ($CAExport | Where-Object { $_.Block -eq 'True' }).Count
   $riskPolicies = ($CAPolicy | Where-Object { $_.Conditions.SignInRiskLevels -or $_.Conditions.UserRiskLevels }).Count
   $devicePolicies = ($CAPolicy | Where-Object { $_.Conditions.Devices.IncludeDevices -or $_.Conditions.Devices.ExcludeDevices -or $_.GrantControls.BuiltInControls -contains 'compliantDevice' -or $_.GrantControls.BuiltInControls -contains 'domainJoinedDevice' }).Count
   $termsPolicies = ($CAPolicy | Where-Object { $_.GrantControls.TermsOfUse }).Count
-  $phishResistant = ($CAExport | Where-Object { $_.'Authentication Strength MFA' -match 'Phishing-resistant' }).Count
+  $phishResistant = @($CAPolicy | Where-Object { Test-IsPhishResistantStrength -Policy $_ }).Count
   $avgModifiedDays = 0
   $now = Get-Date
   $dateVals = @()
