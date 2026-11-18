@@ -255,6 +255,62 @@ Describe 'State-aware Microsoft recommendation assessments' {
         (Get-TestRecommendation 'CA-18').Assessment | Should -Not -Be 'Enforced'
     }
 
+    It 'Assesses structured guest coverage for <Scenario>' -TestCases @(
+        @{ Scenario = 'all guest types and all external tenants'; Expected = 'Enforced' }
+        @{ Scenario = 'a missing guest type'; Expected = 'Needs review' }
+        @{ Scenario = 'selected external tenants'; Expected = 'Needs review' }
+        @{ Scenario = 'missing external tenant scope'; Expected = 'Needs review' }
+        @{ Scenario = 'guest exclusions'; Expected = 'Needs review' }
+        @{ Scenario = 'unknown guest types'; Expected = 'Needs review' }
+        @{ Scenario = 'report-only complete guest coverage'; Expected = 'Report-only' }
+        @{ Scenario = 'legacy guest targeting'; Expected = 'Enforced' }
+    ) {
+        param($Scenario, $Expected)
+        $types = @('internalGuest', 'b2bCollaborationGuest', 'b2bCollaborationMember', 'b2bDirectConnectUser', 'otherExternalUser', 'serviceProvider')
+        $assignment = @{ guestOrExternalUserTypes = $types -join ', '; externalTenants = @{ membershipKind = 'all' } }
+        $policy.conditions.users.includeUsers = @()
+        $policy.conditions.users.includeGuestsOrExternalUsers = $assignment
+        switch ($Scenario) {
+            'a missing guest type' { $assignment.guestOrExternalUserTypes = $types[0..4] -join ',' }
+            'selected external tenants' { $assignment.externalTenants = @{ membershipKind = 'enumerated'; members = @('tenant-id') } }
+            'missing external tenant scope' { $assignment.Remove('externalTenants') }
+            'guest exclusions' { $policy.conditions.users.excludeGuestsOrExternalUsers = @{ guestOrExternalUserTypes = 'internalGuest' } }
+            'unknown guest types' { $assignment.guestOrExternalUserTypes += ', unknownFutureValue' }
+            'report-only complete guest coverage' { $policy.state = 'enabledForReportingButNotEnforced' }
+            'legacy guest targeting' { $policy.conditions.users.includeUsers = @('GuestsOrExternalUsers'); $policy.conditions.users.Remove('includeGuestsOrExternalUsers') }
+        }
+
+        $result = Get-TestRecommendation 'CA-16'
+
+        $result.Assessment | Should -Be $Expected
+        $result.NeedsAttention | Should -Be ($Expected -ne 'Enforced')
+    }
+
+    It 'Reads SDK user exclusions for <Scenario> in <Representation>' -TestCases @(
+        @{ Scenario = 'ordinary exclusions'; Representation = 'SDK'; Designated = $false; Expected = 'Needs review' }
+        @{ Scenario = 'designated emergency exclusions'; Representation = 'SDK'; Designated = $true; Expected = 'Enforced' }
+        @{ Scenario = 'ordinary exclusions'; Representation = 'offline JSON'; Designated = $false; Expected = 'Needs review' }
+        @{ Scenario = 'designated emergency exclusions'; Representation = 'offline JSON'; Designated = $true; Expected = 'Enforced' }
+    ) {
+        param($Scenario, $Representation, $Designated, $Expected)
+        $accountId = '10000000-0000-0000-0000-000000000001'
+        $additional = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $additional.Add('excludeUsers', @($accountId))
+        $policy.conditions.users = [pscustomobject]@{
+            IncludeUsers = @('All'); ExcludeUsers = $null; IncludeGroups = @(); ExcludeGroups = @()
+            IncludeRoles = @(); ExcludeRoles = @(); AdditionalProperties = $additional
+        }
+        if ($Representation -eq 'offline JSON') { $policy = $policy | ConvertTo-Json -Depth 20 | ConvertFrom-Json }
+        $emergencyIds = if ($Designated) { @($accountId) } else { @() }
+
+        (Get-TestRecommendation 'CA-01' -EmergencyIds $emergencyIds).Assessment | Should -Be $Expected
+        if ($Designated) {
+            $emergency = Get-TestRecommendation 'CA-22' -EmergencyIds $emergencyIds
+            $emergency.Evidence.Count | Should -Be 0
+            $emergency.NeedsAttention | Should -BeFalse
+        }
+    }
+
     It 'Does not mistake MFA on one role for complete administrator coverage' {
         $policy.conditions.users.includeUsers = @()
         $policy.conditions.users.includeRoles = @('62e90394-69f5-4237-9190-012177145e10')
@@ -404,6 +460,11 @@ Describe 'State-aware Microsoft recommendation assessments' {
         $policy.conditions.applications.includeApplications = @('All')
         (Get-TestRecommendation 'CA-28').TemplateAssessment | Should -Be 'Matching policy enabled'
         (Get-TestRecommendation 'CA-29').TemplateAssessment | Should -Be 'Not observed'
+        $policy.conditions.applications.includeApplications = @('Office365')
+        (Get-TestRecommendation 'CA-28').TemplateAssessment | Should -Be 'Matching policy enabled'
+        (Get-TestRecommendation 'CA-29').TemplateAssessment | Should -Be 'Not observed'
+        $policy.conditions.applications.includeApplications += '00000003-0000-0ff1-ce00-000000000000'
+        (Get-TestRecommendation 'CA-29').TemplateAssessment | Should -Be 'Matching policy enabled'
         $policy.conditions.applications.includeApplications = @('Office365')
         $policy.grantControls.builtInControls = @('block')
         (Get-TestRecommendation 'CA-28').TemplateAssessment | Should -Be 'Not observed'
@@ -770,6 +831,13 @@ Describe 'Offline recommendation exports' {
         function Get-MgAgreement { [CmdletBinding()] param($AgreementId, $Property) }
         function Get-MgPolicyAuthenticationStrengthPolicy { param([switch]$All, $Property) }
         $exportScript = "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1"
+        $source = Get-Content -LiteralPath $exportScript -Raw
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
+        $importFunction = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Import-CaSnapshot'
+        }, $true)
+        . ([scriptblock]::Create($importFunction.Extent.Text))
         $rawPath = Join-Path $TestDrive 'policies_raw.json'
         $basePolicy = @{
             id = '11111111-1111-1111-1111-111111111111'; displayName = 'MFA'; state = 'enabled'
@@ -792,6 +860,17 @@ Describe 'Offline recommendation exports' {
         $registration.state = 'enabledForReportingButNotEnforced'
         $registration.conditions.applications = @{ includeUserActions = @('urn:user:registersecurityinfo') }
         @($basePolicy, $device, $registration) | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $rawPath
+        function New-TestPortableSnapshot {
+            param([string]$TenantName = 'Synthetic saved tenant', [object[]]$Policies = @($basePolicy))
+            @{
+                SnapshotFormat = 'CAExportSnapshot'; SchemaVersion = 1
+                TenantName = $TenantName; CapturedAt = '2026-01-02 03:04:05Z'; PartialExport = $false
+                Policies = $Policies
+                NamedLocations = @{ Status = 'Available'; Locations = @(); Message = '' }
+                Lookups = @{ Users = @{}; Groups = @{}; Roles = @{}; Applications = @{}; Locations = @{}; TermsOfUse = @{} }
+                AuthenticationStrengths = @(); EmergencyAccessAccountIds = @()
+            }
+        }
     }
 
     It 'Produces all formats with 32 state-aware recommendation cards without calling Graph' {
@@ -840,8 +919,9 @@ Describe 'Offline recommendation exports' {
     It 'Captures a portable snapshot during a <Mode> export and regenerates all formats on a clean offline process' -TestCases @(
         @{ Mode = 'HTML'; IncludeHtml = $true }
         @{ Mode = 'CSV-only'; IncludeHtml = $false }
+        @{ Mode = 'HTML unsafe tenant name'; IncludeHtml = $true; TenantLabel = 'Contoso A/S & Demo' }
     ) {
-        param($Mode, $IncludeHtml)
+        param($Mode, $IncludeHtml, $TenantLabel = 'Synthetic tenant')
         $livePolicies = Get-Content $rawPath -Raw | ConvertFrom-Json -AsHashtable
         $locationId = '44444444-4444-4444-4444-444444444444'
         $livePolicies[1].conditions.locations = @{ includeLocations = @($locationId) }
@@ -856,6 +936,13 @@ Describe 'Offline recommendation exports' {
         }
         $livePolicies[2].conditions.AdditionalProperties = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         $livePolicies[2].conditions.AdditionalProperties.Add('futureCondition', @{ value = 'restricted' })
+        $livePolicies[1].conditions.AdditionalProperties = @{
+            authenticationFlows = @{ transferMethods = 'deviceCodeFlow' }
+        }
+        $livePolicies[1].sessionControls = [pscustomobject]@{
+            SecureSignInSession = $null
+            AdditionalProperties = @{ secureSignInSession = @{ isEnabled = $IncludeHtml } }
+        }
         $emergencyIds = @('10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002')
         Mock Get-PackageProvider { [pscustomobject]@{ Name = 'NuGet' } } -ParameterFilter { $Name -eq 'NuGet' }
         Mock Get-PSRepository { [pscustomobject]@{ InstallationPolicy = 'Trusted' } } -ParameterFilter { $Name -eq 'PSGallery' }
@@ -864,7 +951,7 @@ Describe 'Offline recommendation exports' {
         Mock Get-MgContext {
             [pscustomobject]@{ Account = 'test@example.invalid'; Scopes = @('Policy.Read.All', 'Directory.Read.All', 'RoleManagement.Read.All') }
         }
-        Mock Get-MgOrganization { [pscustomobject]@{ DisplayName = 'Synthetic tenant' } }
+        Mock Get-MgOrganization { [pscustomobject]@{ DisplayName = $TenantLabel } }
         Mock Get-MgIdentityConditionalAccessPolicy { $livePolicies }
         Mock Get-MgDirectoryRole { @() }
         Mock Get-MgRoleManagementDirectoryRoleDefinition { @() }
@@ -904,6 +991,7 @@ Describe 'Offline recommendation exports' {
         [math]::Abs(([datetimeoffset]::UtcNow - [datetimeoffset]::Parse([string]$snapshot.CapturedAt)).TotalMinutes) |
             Should -BeLessThan 2
         $snapshot.Policies.Count | Should -Be 3
+        $snapshot.TenantName | Should -Be $TenantLabel
         $snapshot.Policies[1].conditions.locations.includeLocations[0] | Should -Be $locationId
         $snapshot.NamedLocations.Locations.Count | Should -Be 2
         $snapshot.Lookups.Applications.'88888888-8888-8888-8888-888888888888' | Should -Be 'Sample application'
@@ -940,11 +1028,15 @@ $PSModuleAutoLoadingPreference = 'None'
         $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-01'"
         $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-05'"
         $html | Should -Match "data-assessment='needs-review'[^>]*id='rec-CA-13'"
-        $html | Should -Match 'CA Export v3\.7 - Synthetic tenant'
+        $html | Should -Match ([regex]::Escape("CA Export v3.7 - $([System.Web.HttpUtility]::HtmlEncode($TenantLabel))"))
+        $html | Should -Match '<td[^>]*>deviceCodeFlow</td>'
         $html | Should -Match ([regex]::Escape("Snapshot captured: $($snapshot.CapturedAt)"))
         $html | Should -Not -Match 'not included in raw policy snapshots'
         $connectedCsv = Get-ChildItem $out.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv'
         $offlineCsv = Get-ChildItem $offlineDirectory.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv'
+        $offlineRows = @(Import-Csv $offlineCsv.FullName)
+        $offlineRows[1].'Authentication Flows' | Should -Be 'deviceCodeFlow'
+        $offlineRows[1].'Secure Sign In Session' | Should -Be ([string]$IncludeHtml)
         (Get-Content $offlineCsv.FullName -Raw) | Should -Be (Get-Content $connectedCsv.FullName -Raw)
         if ($IncludeHtml) {
             $connectedJson = Get-ChildItem $out.FullName -Filter '*.json' | Where-Object Name -NotLike '*_raw.json'
@@ -955,6 +1047,9 @@ $PSModuleAutoLoadingPreference = 'None'
             $offlinePolicies = Get-Content $offlineJson.FullName -Raw | ConvertFrom-Json |
                 Select-Object * -ExcludeProperty 'Recommended Name' | ConvertTo-Json -Depth 12
             $offlinePolicies | Should -Be $connectedPolicies
+            $offlineData = Get-Content $offlineJson.FullName -Raw | ConvertFrom-Json
+            $offlineData[1].'Authentication Flows' | Should -Be 'deviceCodeFlow'
+            $offlineData[1].'Secure Sign In Session' | Should -Be $IncludeHtml
             $connectedHtml = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
             $connectedMfaCard = [regex]::Match($connectedHtml, "(?s)<details class='recommendation-card [^>]+id='rec-CA-01'.*?</details>").Value
             $connectedMfaCard | Should -Match "data-assessment='enforced'"
@@ -963,6 +1058,61 @@ $PSModuleAutoLoadingPreference = 'None'
         }
         Should -Invoke Get-MgIdentityConditionalAccessNamedLocation -Times 1 -Exactly -ParameterFilter { $All }
         Should -Invoke Get-MgIdentityConditionalAccessNamedLocation -Times 0 -ParameterFilter { $NamedLocationId }
+    }
+
+    It 'Keeps portable output paths safe for tenant name <TenantLabel>' -TestCases @(
+        @{ TenantLabel = 'Contoso A/S' }
+        @{ TenantLabel = 'nested/../../escape' }
+        @{ TenantLabel = 'nested\..\..\escape' }
+        @{ TenantLabel = 'Demo: "region" <test>|?*' }
+    ) {
+        param($TenantLabel)
+        $snapshotPath = Join-Path $TestDrive 'unsafe-name-input.json'
+        $saved = New-TestPortableSnapshot -TenantName $TenantLabel
+        ConvertTo-Json -InputObject $saved -Depth 30 | Set-Content -LiteralPath $snapshotPath
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive ([guid]::NewGuid().ToString()))
+
+        & $exportScript -RawInputFile $snapshotPath -OutputPath $out.FullName -Html -Json -Csv -CsvPivot -NoBrowser
+
+        $files = @(Get-ChildItem -LiteralPath $out.FullName -File)
+        $files.Count | Should -Be 4
+        foreach ($file in $files) { $file.Name | Should -Not -Match '[<>:"/\\|?*\x00-\x1f]' }
+        $html = Get-Content -LiteralPath ($files | Where-Object Extension -eq '.html').FullName -Raw
+        $html | Should -Match ([regex]::Escape([System.Web.HttpUtility]::HtmlEncode($TenantLabel)))
+    }
+
+    It 'Rejects raw policy shape <Scenario> in legacy and portable inputs' -TestCases @(
+        @{ Scenario = 'null conditions'; Change = { $invalidPolicy.conditions = $null } }
+        @{ Scenario = 'string conditions'; Change = { $invalidPolicy.conditions = 'not-an-object' } }
+        @{ Scenario = 'array conditions'; Change = { $invalidPolicy.conditions = @(@{}) } }
+        @{ Scenario = 'missing state'; Change = { $invalidPolicy.Remove('state') } }
+        @{ Scenario = 'blank state'; Change = { $invalidPolicy.state = ' ' } }
+        @{ Scenario = 'non-string state'; Change = { $invalidPolicy.state = 1 } }
+        @{ Scenario = 'blank ID'; Change = { $invalidPolicy.id = ' ' } }
+        @{ Scenario = 'non-string ID'; Change = { $invalidPolicy.id = @(1) } }
+        @{ Scenario = 'scalar policy'; Change = { $invalidPolicy = 'not-a-policy' } }
+    ) {
+        param($Scenario, $Change)
+        $invalidPolicy = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        . $Change
+        foreach ($portable in @($false, $true)) {
+            $inputPath = Join-Path $TestDrive "invalid-shape-$portable.json"
+            $inputData = if ($portable) { New-TestPortableSnapshot -Policies @($invalidPolicy) } else { ,@($invalidPolicy) }
+            ConvertTo-Json -InputObject $inputData -Depth 30 | Set-Content -LiteralPath $inputPath
+
+            { Import-CaSnapshot -Path $inputPath } | Should -Throw '*Expected raw Graph policies*'
+        }
+    }
+
+    It 'Accepts raw object conditions and unknown future policy states without claiming enforcement' {
+        $futurePolicy = @{ id = '11111111-1111-1111-1111-111111111111'; state = 'unknownFutureValue'; conditions = @{} }
+        $inputPath = Join-Path $TestDrive 'future-policy.json'
+        ConvertTo-Json -InputObject @($futurePolicy) -Depth 10 | Set-Content -LiteralPath $inputPath
+
+        $loaded = Import-CaSnapshot -Path $inputPath
+
+        $loaded.Policies.Count | Should -Be 1
+        $loaded.Policies[0].state | Should -Be 'unknownFutureValue'
     }
 
     It 'Preserves a <InventoryState> inventory and partial-export limits when regenerating a saved snapshot' -TestCases @(

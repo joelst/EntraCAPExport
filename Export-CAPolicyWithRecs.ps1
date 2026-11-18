@@ -577,7 +577,7 @@ function Import-CaSnapshot {
         if (-not $data.PSObject.Properties[$field]) { throw "Snapshot is missing required field '$field'." }
       }
       $capturedAt = [datetimeoffset]::MinValue
-      if ([string]::IsNullOrWhiteSpace($data.TenantName) -or
+      if ($data.TenantName -isnot [string] -or [string]::IsNullOrWhiteSpace($data.TenantName) -or
           -not [datetimeoffset]::TryParse([string]$data.CapturedAt, [ref]$capturedAt) -or
           $data.PartialExport -isnot [bool] -or $data.Policies -isnot [array] -or
           $data.AuthenticationStrengths -isnot [array] -or $data.EmergencyAccessAccountIds -isnot [array]) {
@@ -601,8 +601,11 @@ function Import-CaSnapshot {
     }
     if (-not $policies.Count) { throw 'The input contains no policies.' }
     foreach ($policy in $policies) {
-      if (-not $policy.id -or -not $policy.PSObject.Properties['conditions']) {
-        throw 'Expected raw Graph policies, not enriched policy JSON.'
+      if ($policy -isnot [pscustomobject] -or
+          $policy.id -isnot [string] -or [string]::IsNullOrWhiteSpace($policy.id) -or
+          $policy.state -isnot [string] -or [string]::IsNullOrWhiteSpace($policy.state) -or
+          $policy.conditions -isnot [pscustomobject]) {
+        throw 'Expected raw Graph policies: each entry must be an object with nonempty string id/state and an object conditions field, not enriched policy JSON.'
       }
     }
     return $data
@@ -1283,7 +1286,7 @@ function Test-CaRecommendationSignal {
       $suite = $resources -contains 'All' -or $resources -contains 'Office365'
       switch ($Control) {
         'CA-28' { return ($suite -and ($builtIn -contains 'compliantDevice' -or $builtIn -contains 'domainJoinedDevice' -or ($builtIn -contains 'block' -and (Test-CaConfiguredValue (Get-CaProperty $Policy 'conditions.devices.deviceFilter'))))) }
-        'CA-29' { return (@($resources | Where-Object { $_ -and $_ -notin @('All','None') }).Count -gt 0 -and $resources -notcontains 'All' -and ($builtIn -contains 'compliantDevice' -or $builtIn -contains 'domainJoinedDevice' -or ($builtIn -contains 'block' -and (Test-CaConfiguredValue (Get-CaProperty $Policy 'conditions.devices.deviceFilter'))))) }
+        'CA-29' { return (@($resources | Where-Object { $_ -and $_ -notin @('All','None','Office365') }).Count -gt 0 -and $resources -notcontains 'All' -and ($builtIn -contains 'compliantDevice' -or $builtIn -contains 'domainJoinedDevice' -or ($builtIn -contains 'block' -and (Test-CaConfiguredValue (Get-CaProperty $Policy 'conditions.devices.deviceFilter'))))) }
         'CA-30' { return (($suite -or $resources -contains '00000003-0000-0ff1-ce00-000000000000') -and (Get-CaProperty $Policy 'sessionControls.applicationEnforcedRestrictions.isEnabled') -eq $true) }
         'CA-31' { return ($suite -and ($builtIn -contains 'compliantApplication' -or $builtIn -contains 'approvedApplication')) }
       }
@@ -1308,13 +1311,19 @@ function Get-CaPolicyReviewReason {
     'All' { if (-not $allUsers) { 'All-user coverage is not established; group membership and combinations of targeted policies are not expanded.' } }
     'Admins' { if (-not $allUsers -and @($adminRoles | Where-Object { $_ -notin @($users.includeRoles) }).Count) { 'The full administrator role set is not directly covered. Group/PIM membership and combined policy coverage need review.' } }
     'Guests' {
-      if (-not $allUsers -and @($users.includeUsers) -notcontains 'GuestsOrExternalUsers') {
+      $guestAssignment = Get-CaProperty $users 'includeGuestsOrExternalUsers'
+      $guestTypes = @((Get-CaProperty $guestAssignment 'guestOrExternalUserTypes') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+      $requiredGuestTypes = @('internalGuest', 'b2bCollaborationGuest', 'b2bCollaborationMember', 'b2bDirectConnectUser', 'otherExternalUser', 'serviceProvider')
+      $allGuestTypes = -not @($requiredGuestTypes | Where-Object { $_ -notin $guestTypes }).Count -and
+        -not @($guestTypes | Where-Object { $_ -notin $requiredGuestTypes }).Count
+      $allExternalTenants = (Get-CaProperty $guestAssignment 'externalTenants.membershipKind') -eq 'all'
+      if (-not $allUsers -and @($users.includeUsers) -notcontains 'GuestsOrExternalUsers' -and -not ($allGuestTypes -and $allExternalTenants)) {
         'Full guest/external-user coverage is not established. Review guest types, external tenants and cross-tenant MFA trust.'
       }
     }
   }
   if (@(Get-CaProperty $users 'excludeGroups').Count -or @(Get-CaProperty $users 'excludeRoles').Count -or (Test-CaConfiguredValue (Get-CaProperty $users 'excludeGuestsOrExternalUsers'))) { 'Group, role or guest exclusions require membership and population review.' }
-  $extraUsers = @($users.excludeUsers | Where-Object { $_ -and $_ -notin $EmergencyAccessAccountId })
+  $extraUsers = @(Get-CaProperty $users 'excludeUsers' | Where-Object { $_ -and $_ -notin $EmergencyAccessAccountId })
   if ($extraUsers.Count) { 'User exclusions are not identified as designated emergency accounts; validate the coverage gap.' }
   if ($Recommendation.Users -in @('All','Admins','Guests') -and (Test-CaConfiguredValue (Get-CaProperty $conditions 'clientApplications'))) { 'A workload assignment is not proof of user protection.' }
   $resourceCovered = switch ($Recommendation.Resources) {
@@ -1325,7 +1334,7 @@ function Get-CaPolicyReviewReason {
     'DeviceRegistration' { @($apps.includeUserActions) -contains 'urn:user:registerdevice' }
     'Microsoft365' { @($apps.includeApplications) -contains 'All' -or @($apps.includeApplications) -contains 'Office365' }
     'SharePoint' { @($apps.includeApplications) -contains 'All' -or @($apps.includeApplications) -contains 'Office365' -or @($apps.includeApplications) -contains '00000003-0000-0ff1-ce00-000000000000' }
-    'SelectedApps' { @(Get-CaProperty $apps 'includeApplications' | Where-Object { $_ -and $_ -notin @('All','None') }).Count -gt 0 }
+    'SelectedApps' { @(Get-CaProperty $apps 'includeApplications' | Where-Object { $_ -and $_ -notin @('All','None','Office365') }).Count -gt 0 }
     default { $true }
   }
   if (-not $resourceCovered) { 'The required target resources or user action are not covered by this policy.' }
@@ -1412,7 +1421,8 @@ function Get-CaRecommendationResult {
         $includedUsers = @(Get-CaProperty $users 'includeUsers')
         $broadAssignment = 'All' -in $includedUsers -or @(Get-CaProperty $users 'includeGroups').Count -or @(Get-CaProperty $users 'includeRoles').Count
         $targetedAccounts = @($EmergencyAccessAccountId | Where-Object { $broadAssignment -or $_ -in $includedUsers })
-        $missing = @($targetedAccounts | Where-Object { $_ -notin @($users.excludeUsers) })
+        $excludedUsers = @(Get-CaProperty $users 'excludeUsers')
+        $missing = @($targetedAccounts | Where-Object { $_ -notin $excludedUsers })
         if (-not $missing.Count) { continue }
         $issues = @('Potentially targeted designated emergency accounts lack direct exclusions. Verify actual targeting and group-based exclusions before changing policy.')
       }
@@ -1758,7 +1768,9 @@ else {
 
 # ---------------- Save portable snapshot ----------------
 # Save collection data before rendering so it remains reusable even if a report export fails.
-$baseName = "CAExportRecs_${TenantName}_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$tenantFileName = ($TenantName -replace '[<>:"/\\|?*\x00-\x1f]', '_').Trim().TrimEnd('.')
+if ([string]::IsNullOrWhiteSpace($tenantFileName)) { $tenantFileName = 'UnknownTenant' }
+$baseName = "CAExportRecs_${tenantFileName}_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 if (-not $script:OfflineMode) {
   Initialize-AuthStrengthCache
   $snapshot = [ordered]@{
@@ -1792,7 +1804,7 @@ foreach ($Policy in $CAPolicy) {
   $InclDev = $Policy.conditions.devices.includeDevices
   $ExclDev = $Policy.conditions.devices.excludeDevices
   $devFilters = $Policy.conditions.devices.deviceFilter.rule
-  $authenticationFlowsString = ( $Policy.conditions.additionalProperties.authenticationFlows.values -join ', ' )
+  $authenticationFlowsString = @(Get-CaProperty $Policy 'conditions.authenticationFlows.transferMethods') -join ', '
   $InclLocation = $Policy.conditions.locations.includeLocations | ForEach-Object { if ($_ -and (Test-IsGuid $_) -and $LocMap.ContainsKey($_)) {
       $LocMap[$_] 
     }
@@ -1903,7 +1915,7 @@ foreach ($Policy in $CAPolicy) {
     'Persistent Browser'                = $Policy.sessionControls.persistentBrowser.mode
     'Continuous Access Evaluation'      = $Policy.sessionControls.continuousAccessEvaluation.mode
     'Resilient Defaults'                = $Policy.sessionControls.disableResilienceDefaults
-    'Secure Sign In Session'            = $Policy.sessionControls.additionalProperties.secureSignInSession.values
+    'Secure Sign In Session'            = Get-CaProperty $Policy 'sessionControls.secureSignInSession.isEnabled'
     RawJson                             = ''
   }
 }
@@ -2223,6 +2235,8 @@ if ($HTMLExport) {
     --cp-sheen: rgba(255, 255, 255, 0.04);
     --cp-highlight: rgba(253, 142, 161, 0.12);
   }
+  /* Use the existing secondary text color for accessible dark-mode contrast. */
+  html[data-theme="dark"] { --cp-text-muted: var(--cp-text-soft); }
   * { box-sizing:border-box; }
   html, body { margin:0; padding:0; }
   body { font-family:"Segoe UI",Aptos,Calibri,-apple-system,BlinkMacSystemFont,sans-serif; font-size:0.9375rem; line-height:1.5; background:var(--cp-bg); color:var(--cp-text); }

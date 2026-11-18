@@ -137,6 +137,8 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 - Full script: `CAExportRecs_<TenantName>_YYYYMMDD_HHMMSS.*`
 - Lightweight script: `CAExport_<TenantName>_YYYYMMDD_HHMMSS.*`
 
+The full script sanitizes tenant names for portable filenames; report titles and snapshot metadata retain the original tenant name.
+
 ---
 ## Parameters (Full Script)
 
