@@ -3100,10 +3100,10 @@ if ($CsvExport) {
     $null 
   }
   if (-not $exportSet) {
-    Write-Warn 'No CAExport data found; exporting raw policies.'; $CAPolicy | Select-Object * | Export-Csv -NoTypeInformation -Path $LaunchCsv 
+    Write-Warn 'No CAExport data found; exporting raw policies.'; $CAPolicy | Select-Object * | Export-Csv -Path $LaunchCsv
   }
   else {
-    $exportSet | Export-Csv -NoTypeInformation -Path $LaunchCsv 
+    $exportSet | Export-Csv -Path $LaunchCsv
   }
   Write-Info "CSV saved: $LaunchCsv"
 }
@@ -3116,7 +3116,7 @@ if ($CsvPivotExport) {
   }
   else {
     try {
-      $pivotToExport | Export-Csv -NoTypeInformation -Path $LaunchCsvPivot
+      $pivotToExport | Export-Csv -Path $LaunchCsvPivot
       Write-Info "Pivot CSV saved: $LaunchCsvPivot"
     }
     catch {

@@ -720,7 +720,8 @@ Describe 'Offline recommendation exports' {
 
     It 'Produces all formats with 32 state-aware recommendation cards without calling Graph' {
         $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'all-formats')
-        & $exportScript -RawInputFile $rawPath -OutputPath $out.FullName -Html -Json -Csv -CsvPivot -NoBrowser
+        & $exportScript -RawInputFile $rawPath -OutputPath $out.FullName -Html -Json -Csv -CsvPivot -NoBrowser -WarningVariable exportWarnings
+        @($exportWarnings | Where-Object Message -Like '*NoTypeInformation*').Count | Should -Be 0
         $html = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
         ([regex]::Matches($html, "<details class='recommendation-card ")).Count | Should -Be 32
         foreach ($state in @('enforced','report-only','disabled','missing','needs-review','no-findings')) {
@@ -739,6 +740,11 @@ Describe 'Offline recommendation exports' {
         $html | Should -Match 'not included in raw policy snapshots'
         @(Get-ChildItem $out.FullName -Filter '*.json').Count | Should -Be 1
         @(Get-ChildItem $out.FullName -Filter '*.csv').Count | Should -Be 2
+        foreach ($csv in Get-ChildItem $out.FullName -Filter '*.csv') {
+            Get-Content $csv.FullName -TotalCount 1 | Should -Not -Match '^#TYPE'
+        }
+        $policyCsv = Get-ChildItem $out.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv'
+        @(Import-Csv $policyCsv.FullName).Count | Should -Be 3
         $json = Get-ChildItem $out.FullName -Filter '*.json' | Where-Object Name -NotLike '*_raw.json'
         @(Get-Content $json.FullName -Raw | ConvertFrom-Json).Count | Should -Be 3
     }
