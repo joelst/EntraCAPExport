@@ -880,19 +880,14 @@ function Test-IsPhishResistantStrength {
     .SYNOPSIS
       Determines if a policy's assigned Authentication Strength is phishing resistant.
     .DESCRIPTION
-      Retrieves the assigned authentication strength object (cached) and inspects AllowedCombinations.
-      If any combination is in the non-phish-resistant set, policy is NOT phishing resistant.
+      Uses the same verified strength IDs and allowed combinations as the recommendation assessments.
     .PARAMETER Policy
       Raw Conditional Access policy object with GrantControls.AuthenticationStrength populated.
     .OUTPUTS
       [bool] True when strength is considered phishing resistant; otherwise False.
   #>
   param($Policy)
-  $strengthObj = Get-AssignedAuthStrengthObject -Policy $Policy
-  if (-not $strengthObj -or -not $strengthObj.AllowedCombinations) { return $false }
-  $nonPhish = @('deviceBasedPush', 'temporaryAccessPassOneTime', 'temporaryAccessPassMultiUse', 'microsoftAuthenticatorPush', 'sms', 'voice', 'softwareOath', 'hardwareOath', 'x509CertificateSingleFactor', 'federatedSingleFactor', 'qrCodePin')
-  $contains = ($strengthObj.AllowedCombinations | Where-Object { $nonPhish -contains $_ }).Count -gt 0
-  return (-not $contains)
+  return (Test-CaMfaStrength -Policy $Policy -PhishingResistant)
 }
 
 function Test-PolicyRequiresMfaForAdmins {
@@ -1029,15 +1024,16 @@ function Get-CaProperty {
     foreach ($source in @($value, $value.AdditionalProperties)) {
       if ($null -eq $source) { continue }
       if ($source -is [System.Collections.IDictionary]) {
-        $next = $source[$name]
-        if ($null -eq $next) {
+        $candidate = $source[$name]
+        if ($null -eq $candidate) {
           foreach ($key in $source.Keys) {
-            if ($key -ieq $name -and $null -ne $source[$key]) { $next = $source[$key]; break }
+            if ($key -ieq $name -and $null -ne $source[$key]) { $candidate = $source[$key]; break }
           }
         }
       }
-      else { $next = $source.PSObject.Properties[$name].Value }
-      if ($null -ne $next) { break }
+      else { $candidate = $source.PSObject.Properties[$name].Value }
+      if ($null -eq $next) { $next = $candidate }
+      if (Test-CaConfiguredValue $candidate) { $next = $candidate; break }
     }
     $value = $next
   }
@@ -1161,7 +1157,7 @@ function Get-CaRecommendationCatalog {
     @{ Id='CA-27'; Name='Review on-behalf-of agent access'; Kind='Review'; Users='Agents'; Resources='All'; Path='policy-on-behalf-of-agents'; Background='Delegated agent access and autonomous agent access have different identity and policy evaluation boundaries.'; Verify='Review delegated user and agent policies, supported agent flows, resource scope and sign-in evidence; do not infer coverage from a user MFA policy alone.'; Requirements=@('Microsoft Agent 365 and the documented Entra licensing and supported agent configuration.', 'Inventory agents acting for users and validate supported service boundaries; this v1.0 snapshot cannot certify coverage.'); Extra=@{ 'Conditional Access for agents'="$($base)agent-id" } },
     @{ Id='CA-28'; Name='Microsoft 365: block unmanaged-device access'; Kind='Template'; Users='All'; Resources='Microsoft365'; Path='policy-all-users-device-compliance'; Background='An optional resource-scoped alternative to an all-resource device baseline. The Office 365 resource grouping covers Microsoft 365 service dependencies; one service alone does not establish suite-wide coverage. Compliance is stronger than management or registration alone.'; Verify='Review the matching deployment state, user/resource exclusions, device identity in supported browsers, and real sign-ins. Recognized patterns require compliance (optionally hybrid join), or block with a simple compliant-device exclusion/negative filter. Complex filters need manual review.'; Requirements=@($p1, 'Intune or supported partner licensing and assigned compliance policies; registered/enrolled devices; supported browser/client device authentication.', 'Pilot enrollment, guests, emergency access and service dependencies before blocking. Blocking everyone from an app is not evidence of device-specific protection.'); Allow=@('devices'); Template=[ordered]@{ 'Users'='All users, with designated emergency accounts excluded; review any approved population changes.'; 'Resources'='Office 365 (Graph token Office365), or a stronger all-resource policy; no unreviewed exclusions.'; 'Device / grant'='Require compliantDevice (optionally OR domainJoinedDevice for hybrid Windows); alternatively Block with device filter exclude: device.isCompliant -eq True, or include: device.isCompliant -ne True.'; 'Rollout'='Start report-only; verify unmanaged and unregistered devices are denied, and approved devices can sign in.' } },
     @{ Id='CA-29'; Name='Selected applications: block unmanaged-device access'; Kind='Template'; Users='All'; Resources='SelectedApps'; Path='policy-all-users-device-compliance'; Background='Sensitive enterprise applications can have stricter device requirements without applying the same restriction to every resource. This template inventories explicit resource assignments; it cannot discover which business applications ought to be protected.'; Verify='Confirm the application IDs in evidence match your sensitive-app inventory. Target resource/service applications, not public client apps such as Outlook. Validate dependencies and actual users; a match is not complete coverage of your application estate.'; Requirements=@($p1, 'Defined sensitive-resource inventory and owners; Intune/supported compliance partner, assigned compliance policies, device registration and supported clients.', 'Test application dependencies, guest access, emergency recovery and report-only results. A device marked managed or registered is not necessarily compliant.'); Allow=@('devices'); Template=[ordered]@{ 'Users'='All users of the selected resources; review scoped groups and exclusions separately.'; 'Resources'='Explicitly selected resource application IDs. This measurement reports observed assignments, not coverage of an externally defined inventory.'; 'Device / grant'='Require compliantDevice (optionally OR domainJoinedDevice); or Block using the simple compliant-device filter patterns documented in CA-28.'; 'Rollout'='Pilot each application and its service dependencies; verify both registered non-compliant and unregistered devices.' } },
-    @{ Id='CA-30'; Name='SharePoint / OneDrive: limited browser access'; Kind='Template'; Users='All'; Resources='SharePoint'; Path='policy-all-users-app-enforced-restrictions'; Background='Limited web-only access is an alternative to total blocking: supported SharePoint/OneDrive configurations restrict downloading, printing and syncing on unmanaged devices. A Conditional Access session control alone does not prove that these restrictions are configured.'; Verify='Verify SharePoint tenant/site ConditionalAccessPolicy settings and the companion policy blocking unsupported desktop/mobile access. Confirm download, print, sync and editing behavior. This export cannot read those SharePoint settings.'; Requirements=@($p1, 'SharePoint Online licensing and SharePoint Administrator to configure unmanaged-device controls; supported OS/browser combinations.', 'Configure SharePoint tenant/site limited-access settings and protect legacy/non-browser clients. SharePoint-only restrictions do not protect Exchange or every Microsoft 365 service.'); Allow=@('devices'); Template=[ordered]@{ 'Users'='All users or an explicitly approved population; validate guests and exclusions.'; 'Resources'='SharePoint Online (00000003-0000-0ff1-ce00-000000000000), Office 365, or All resources.'; 'Session'='Enable application-enforced restrictions for browser access; configure SharePoint unmanaged-device limited web-only access.'; 'Companion controls'='Review the companion non-browser block/device policy and legacy authentication block. These and SharePoint-side settings are not inferred from the session control.' } },
+    @{ Id='CA-30'; Name='SharePoint / OneDrive: limited browser access'; Kind='Template'; Users='All'; Resources='SharePoint'; Path='policy-all-users-app-enforced-restrictions'; Background='Limited web-only access is an alternative to total blocking: supported SharePoint/OneDrive configurations restrict downloading, printing and syncing on unmanaged devices. A Conditional Access session control alone does not prove that these restrictions are configured.'; Verify='Verify SharePoint tenant/site ConditionalAccessPolicy settings and the companion policy blocking unsupported desktop/mobile access. Confirm download, print, sync and editing behavior. This export cannot read those SharePoint settings.'; Requirements=@($p1, 'SharePoint Online licensing and SharePoint Administrator to configure unmanaged-device controls; supported OS/browser combinations.', 'Configure SharePoint tenant/site limited-access settings and protect legacy/non-browser clients. SharePoint-only restrictions do not protect Exchange or every Microsoft 365 service.'); Template=[ordered]@{ 'Users'='All users or an explicitly approved population; validate guests and exclusions.'; 'Resources'='SharePoint Online (00000003-0000-0ff1-ce00-000000000000), Office 365, or All resources.'; 'Session'='Enable application-enforced restrictions for browser access; configure SharePoint unmanaged-device limited web-only access.'; 'Companion controls'='Review the companion non-browser block/device policy and legacy authentication block. These and SharePoint-side settings are not inferred from the session control.' } },
     @{ Id='CA-31'; Name='Microsoft 365 mobile: require app protection'; Kind='Template'; Users='All'; Resources='Microsoft365'; Path='policy-all-users-approved-app-or-app-protection'; Background='App protection can protect organizational data on supported personal iOS/Android devices without requiring full device enrollment. This is a different business choice from blocking all unmanaged devices.'; Verify='Require compliantApplication on every allowed grant path for Android and iOS. Validate assigned Intune app-protection policies, broker registration and supported Microsoft 365 apps. Approved-client-app alone or compliance OR app protection does not establish mandatory app protection.'; Requirements=@($p1, 'Microsoft Intune licenses and assigned app-protection policies for the intended users and supported apps.', 'Supported Android/iOS applications, required authentication broker/device registration and current client versions; pilot personal and corporate devices.'); Platforms=@('android','iOS'); Allow=@('platforms'); Template=[ordered]@{ 'Users'='All intended Microsoft 365 mobile users; review assignment groups and exceptions.'; 'Resources'='Office 365 or All resources; inspect dependencies and resource exclusions.'; 'Conditions'='Android and iOS; Mobile apps and desktop clients (or all clients). Browser-only scope is not a match.'; 'Grant'='Require app protection policy (compliantApplication), with no OR alternative that bypasses it. Deploy the supporting Intune app-protection policy.' } }
   )
   foreach ($definition in $definitions) {
@@ -1258,7 +1254,7 @@ function Test-CaRecommendationSignal {
     'CA-06' { return [bool](Test-CA06 $Policy) }
     'CA-07' {
       $users = Get-CaProperty $Policy 'conditions.users'
-      $targets = @($users.includeUsers | Where-Object { $_ -and $_ -ne 'None' }) + @(Get-CaProperty $users 'includeGroups') + @(Get-CaProperty $users 'includeRoles')
+      $targets = @(Get-CaProperty $users 'includeUsers' | Where-Object { $_ -and $_ -ne 'None' }) + @(Get-CaProperty $users 'includeGroups') + @(Get-CaProperty $users 'includeRoles')
       $clientTargets = @(Get-CaProperty $Policy 'conditions.clientApplications.includeServicePrincipals') + @(Get-CaProperty $Policy 'conditions.clientApplications.includeAgentIdServicePrincipals')
       $clientFilter = (Get-CaProperty $Policy 'conditions.clientApplications.servicePrincipalFilter.rule') -or (Get-CaProperty $Policy 'conditions.clientApplications.agentIdServicePrincipalFilter.rule')
       return (-not $targets.Count -and -not (Test-CaConfiguredValue (Get-CaProperty $users 'includeGuestsOrExternalUsers')) -and -not $clientTargets.Count -and -not $clientFilter -and -not (Test-CaConfiguredValue (Get-CaProperty $Policy 'conditions.agents')))
@@ -1305,11 +1301,15 @@ function Get-CaPolicyReviewReason {
   $conditions = Get-CaProperty $Policy 'conditions'
   $users = Get-CaProperty $conditions 'users'
   $apps = Get-CaProperty $conditions 'applications'
-  $allUsers = @($users.includeUsers) -contains 'All'
+  $includedUsers = @(Get-CaProperty $users 'includeUsers')
+  $includedRoles = @(Get-CaProperty $users 'includeRoles')
+  $includedApps = @(Get-CaProperty $apps 'includeApplications')
+  $includedActions = @(Get-CaProperty $apps 'includeUserActions')
+  $allUsers = $includedUsers -contains 'All'
   $adminRoles = @('62e90394-69f5-4237-9190-012177145e10','e8611ab8-c189-46e8-94e1-60213ab1f814','b1be1c3e-b65d-4f19-8427-f6fa0d97feb9','194ae4cb-b126-40b2-bd5b-6091b380977d','9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3','158c047a-c907-4556-b7ef-446551a6b5f7','c4e39bd9-1100-46d3-8c65-fb160da0071f','7be44c8a-adaf-4e2a-84d6-ab2649e08a13','729827e3-9c14-49f7-bb1b-9608f156bbb8','966707d0-3269-4727-9be2-8c3a10f19b9d','fe930be7-5e62-47db-91af-98c3a49a38b1','b0f54661-2d74-4c50-afa3-1ec803f12efe','29232cdf-9323-42fd-ade2-1d097af3e4de','f28a1f50-f6e7-4571-818b-6a12f2af6b6c')
   switch ($Recommendation.Users) {
     'All' { if (-not $allUsers) { 'All-user coverage is not established; group membership and combinations of targeted policies are not expanded.' } }
-    'Admins' { if (-not $allUsers -and @($adminRoles | Where-Object { $_ -notin @($users.includeRoles) }).Count) { 'The full administrator role set is not directly covered. Group/PIM membership and combined policy coverage need review.' } }
+    'Admins' { if (-not $allUsers -and @($adminRoles | Where-Object { $_ -notin $includedRoles }).Count) { 'The full administrator role set is not directly covered. Group/PIM membership and combined policy coverage need review.' } }
     'Guests' {
       $guestAssignment = Get-CaProperty $users 'includeGuestsOrExternalUsers'
       $guestTypes = @((Get-CaProperty $guestAssignment 'guestOrExternalUserTypes') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -1317,7 +1317,7 @@ function Get-CaPolicyReviewReason {
       $allGuestTypes = -not @($requiredGuestTypes | Where-Object { $_ -notin $guestTypes }).Count -and
         -not @($guestTypes | Where-Object { $_ -notin $requiredGuestTypes }).Count
       $allExternalTenants = (Get-CaProperty $guestAssignment 'externalTenants.membershipKind') -eq 'all'
-      if (-not $allUsers -and @($users.includeUsers) -notcontains 'GuestsOrExternalUsers' -and -not ($allGuestTypes -and $allExternalTenants)) {
+      if (-not $allUsers -and $includedUsers -notcontains 'GuestsOrExternalUsers' -and -not ($allGuestTypes -and $allExternalTenants)) {
         'Full guest/external-user coverage is not established. Review guest types, external tenants and cross-tenant MFA trust.'
       }
     }
@@ -1327,14 +1327,14 @@ function Get-CaPolicyReviewReason {
   if ($extraUsers.Count) { 'User exclusions are not identified as designated emergency accounts; validate the coverage gap.' }
   if ($Recommendation.Users -in @('All','Admins','Guests') -and (Test-CaConfiguredValue (Get-CaProperty $conditions 'clientApplications'))) { 'A workload assignment is not proof of user protection.' }
   $resourceCovered = switch ($Recommendation.Resources) {
-    'All' { @($apps.includeApplications) -contains 'All' }
-    'AdminPortals' { @($apps.includeApplications) -contains 'All' -or @($apps.includeApplications) -contains 'MicrosoftAdminPortals' }
-    'AzureManagement' { @($apps.includeApplications) -contains 'All' -or @($apps.includeApplications) -contains '797f4846-ba00-4fd7-ba43-dac1f8f63013' }
-    'Registration' { @($apps.includeUserActions) -contains 'urn:user:registersecurityinfo' }
-    'DeviceRegistration' { @($apps.includeUserActions) -contains 'urn:user:registerdevice' }
-    'Microsoft365' { @($apps.includeApplications) -contains 'All' -or @($apps.includeApplications) -contains 'Office365' }
-    'SharePoint' { @($apps.includeApplications) -contains 'All' -or @($apps.includeApplications) -contains 'Office365' -or @($apps.includeApplications) -contains '00000003-0000-0ff1-ce00-000000000000' }
-    'SelectedApps' { @(Get-CaProperty $apps 'includeApplications' | Where-Object { $_ -and $_ -notin @('All','None','Office365') }).Count -gt 0 }
+    'All' { $includedApps -contains 'All' }
+    'AdminPortals' { $includedApps -contains 'All' -or $includedApps -contains 'MicrosoftAdminPortals' }
+    'AzureManagement' { $includedApps -contains 'All' -or $includedApps -contains '797f4846-ba00-4fd7-ba43-dac1f8f63013' }
+    'Registration' { $includedActions -contains 'urn:user:registersecurityinfo' }
+    'DeviceRegistration' { $includedActions -contains 'urn:user:registerdevice' }
+    'Microsoft365' { $includedApps -contains 'All' -or $includedApps -contains 'Office365' }
+    'SharePoint' { $includedApps -contains 'All' -or $includedApps -contains 'Office365' -or $includedApps -contains '00000003-0000-0ff1-ce00-000000000000' }
+    'SelectedApps' { @($includedApps | Where-Object { $_ -and $_ -notin @('All','None','Office365') }).Count -gt 0 }
     default { $true }
   }
   if (-not $resourceCovered) { 'The required target resources or user action are not covered by this policy.' }

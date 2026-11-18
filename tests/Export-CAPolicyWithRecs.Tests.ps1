@@ -123,16 +123,21 @@ Describe 'State-aware Microsoft recommendation assessments' {
         (Get-TestRecommendation 'CA-01').Assessment | Should -Be 'Needs review'
     }
 
-    It 'Retains scope restrictions shadowed by null SDK properties in <Representation>' -TestCases @(
-        @{ Representation = 'ordinal SDK dictionaries' }
-        @{ Representation = 'offline JSON' }
+    It 'Retains scope restrictions shadowed by <TypedValue> SDK properties in <Representation>' -TestCases @(
+        @{ Representation = 'ordinal SDK dictionaries'; TypedValue = 'null' }
+        @{ Representation = 'offline JSON'; TypedValue = 'null' }
+        @{ Representation = 'ordinal SDK dictionaries'; TypedValue = 'empty' }
+        @{ Representation = 'offline JSON'; TypedValue = 'empty' }
     ) {
-        param($Representation)
+        param($Representation, $TypedValue)
         $additional = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         $additional.Add('locations', @{ includeLocations = @('office-only'); excludeLocations = @() })
         $policy.conditions = [pscustomobject]@{
             Users = $policy.conditions.users; Applications = $policy.conditions.applications
             ClientAppTypes = @('all'); Locations = $null; AdditionalProperties = $additional
+        }
+        if ($TypedValue -eq 'empty') {
+            $policy.conditions.Locations = [pscustomobject]@{ IncludeLocations = @(); ExcludeLocations = $null }
         }
         if ($Representation -eq 'offline JSON') {
             $policy = $policy | ConvertTo-Json -Depth 20 | ConvertFrom-Json
@@ -142,6 +147,67 @@ Describe 'State-aware Microsoft recommendation assessments' {
 
         $result.Assessment | Should -Be 'Needs review'
         ($result.Evidence[0].Issues -join ' ') | Should -Match "Additional condition 'locations' limits coverage"
+    }
+
+    It 'Preserves an explicitly disabled typed session control over additional metadata' {
+        $policy.sessionControls.secureSignInSession = [pscustomobject]@{
+            IsEnabled = $false; AdditionalProperties = @{ isEnabled = $true }
+        }
+
+        (Get-CaProperty $policy 'sessionControls.secureSignInSession.isEnabled') | Should -BeFalse
+        (Get-TestRecommendation 'CA-23').Evidence.Count | Should -Be 0
+    }
+
+    It 'Resolves nested <Scenario> assignments in <Representation>' -TestCases @(
+        foreach ($representation in @('SDK', 'offline JSON')) {
+            @{ Scenario = 'all users'; Representation = $representation; Container = 'users'; Field = 'includeUsers'; Value = 'All'; Control = 'CA-01' }
+            @{ Scenario = 'legacy guests'; Representation = $representation; Container = 'users'; Field = 'includeUsers'; Value = 'GuestsOrExternalUsers'; Control = 'CA-16' }
+            @{ Scenario = 'administrator roles'; Representation = $representation; Container = 'users'; Field = 'includeRoles'; Control = 'CA-04' }
+            @{ Scenario = 'all resources'; Representation = $representation; Container = 'applications'; Field = 'includeApplications'; Value = 'All'; Control = 'CA-01' }
+            @{ Scenario = 'admin portals'; Representation = $representation; Container = 'applications'; Field = 'includeApplications'; Value = 'MicrosoftAdminPortals'; Control = 'CA-17' }
+            @{ Scenario = 'Azure management'; Representation = $representation; Container = 'applications'; Field = 'includeApplications'; Value = '797f4846-ba00-4fd7-ba43-dac1f8f63013'; Control = 'CA-18' }
+            @{ Scenario = 'Microsoft 365'; Representation = $representation; Container = 'applications'; Field = 'includeApplications'; Value = 'Office365'; Control = 'CA-28'; Metric = 'TemplateAssessment'; Expected = 'Matching policy enabled' }
+            @{ Scenario = 'SharePoint'; Representation = $representation; Container = 'applications'; Field = 'includeApplications'; Value = '00000003-0000-0ff1-ce00-000000000000'; Control = 'CA-30'; Metric = 'TemplateAssessment'; Expected = 'Matching policy enabled' }
+            @{ Scenario = 'security registration'; Representation = $representation; Container = 'applications'; Field = 'includeUserActions'; Value = 'urn:user:registersecurityinfo'; Control = 'CA-13' }
+            @{ Scenario = 'device registration'; Representation = $representation; Container = 'applications'; Field = 'includeUserActions'; Value = 'urn:user:registerdevice'; Control = 'CA-11' }
+        }
+    ) {
+        param($Scenario, $Representation, $Container, $Field, $Value, $Control, $Metric = 'Assessment', $Expected = 'Enforced')
+        $values = @($Value)
+        if ($Field -eq 'includeRoles') {
+            $values = @(
+                '62e90394-69f5-4237-9190-012177145e10', 'e8611ab8-c189-46e8-94e1-60213ab1f814',
+                'b1be1c3e-b65d-4f19-8427-f6fa0d97feb9', '194ae4cb-b126-40b2-bd5b-6091b380977d',
+                '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3', '158c047a-c907-4556-b7ef-446551a6b5f7',
+                'c4e39bd9-1100-46d3-8c65-fb160da0071f', '7be44c8a-adaf-4e2a-84d6-ab2649e08a13',
+                '729827e3-9c14-49f7-bb1b-9608f156bbb8', '966707d0-3269-4727-9be2-8c3a10f19b9d',
+                'fe930be7-5e62-47db-91af-98c3a49a38b1', 'b0f54661-2d74-4c50-afa3-1ec803f12efe',
+                '29232cdf-9323-42fd-ade2-1d097af3e4de', 'f28a1f50-f6e7-4571-818b-6a12f2af6b6c'
+            )
+        }
+        $additional = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $additional.Add($Field, $values)
+        if ($Container -eq 'users') {
+            $policy.conditions.users = [pscustomobject]@{
+                IncludeUsers = $null; IncludeRoles = $null; IncludeGroups = @()
+                ExcludeUsers = @(); ExcludeRoles = @(); ExcludeGroups = @(); AdditionalProperties = $additional
+            }
+        }
+        else {
+            $policy.conditions.applications = [pscustomobject]@{
+                IncludeApplications = $null; IncludeUserActions = $null
+                ExcludeApplications = @(); AdditionalProperties = $additional
+            }
+        }
+        if ($Control -eq 'CA-28') { $policy.grantControls.builtInControls = @('compliantDevice') }
+        if ($Control -eq 'CA-30') {
+            $policy.conditions.clientAppTypes = @('browser')
+            $policy.sessionControls.applicationEnforcedRestrictions = @{ isEnabled = $true }
+        }
+        if ($Representation -eq 'offline JSON') { $policy = $policy | ConvertTo-Json -Depth 20 | ConvertFrom-Json }
+
+        (Get-TestRecommendation $Control).$Metric | Should -Be $Expected
+        (Get-TestRecommendation 'CA-07').Assessment | Should -Be 'No findings'
     }
 
     It 'Separates optional and operational applicability reviews from actionable attention findings' {
@@ -190,6 +256,32 @@ Describe 'State-aware Microsoft recommendation assessments' {
         $script:AuthStrengthCachePopulated = $true
         $script:AuthStrengthCache = @{ custom = [pscustomobject]@{ AllowedCombinations = @('fido2') } }
         (Get-TestRecommendation 'CA-05').Assessment | Should -Be 'Needs review'
+    }
+
+    It 'Aligns Summary phishing-resistance counts with verified strength metadata for <Scenario>' -TestCases @(
+        @{ Scenario = 'password and SMS'; Combinations = @('password,sms'); Expected = $false }
+        @{ Scenario = 'unknown combinations'; Combinations = @('unknownFutureValue'); Expected = $false }
+        @{ Scenario = 'mixed resistant and ordinary MFA'; Combinations = @('fido2', 'password,sms'); Expected = $false }
+        @{ Scenario = 'verified resistant combinations'; Combinations = @('fido2', 'windowsHelloForBusiness', 'x509CertificateMultiFactor'); Expected = $true }
+        @{ Scenario = 'the built-in resistant strength'; Id = '00000000-0000-0000-0000-000000000004'; Expected = $true }
+        @{ Scenario = 'cached resistant combinations'; Cached = $true; Combinations = @('fido2'); Expected = $true }
+        @{ Scenario = 'cached unknown combinations'; Cached = $true; Combinations = @('unknownFutureValue'); Expected = $false }
+        @{ Scenario = 'unavailable custom metadata'; Expected = $false }
+    ) {
+        param($Scenario, $Expected, $Id = 'custom-summary-strength', $Combinations = @(), $Cached = $false)
+        $roleId = '62e90394-69f5-4237-9190-012177145e10'
+        $script:RoleMap = @{ $roleId = 'Global Administrator' }
+        $policy.conditions.users.includeRoles = @($roleId)
+        $policy.grantControls.builtInControls = @()
+        $policy.grantControls.authenticationStrength = @{ id = $Id }
+        $script:AuthStrengthCachePopulated = $true
+        $script:AuthStrengthCache = @{}
+        if ($Cached) { $script:AuthStrengthCache[$Id] = @{ allowedCombinations = $Combinations } }
+        else { $policy.grantControls.authenticationStrength.allowedCombinations = $Combinations }
+
+        (Test-IsPhishResistantStrength $policy) | Should -Be $Expected
+        (Test-PolicyRequiresPhishResistantMfaForAdmins $policy) | Should -Be $Expected
+        ((Get-TestRecommendation 'CA-05').Assessment -eq 'Enforced') | Should -Be $Expected
     }
 
     It 'Checks cached combinations for a partial assigned strength with cache available = <Cached>' -TestCases @(
@@ -286,13 +378,15 @@ Describe 'State-aware Microsoft recommendation assessments' {
         $result.NeedsAttention | Should -Be ($Expected -ne 'Enforced')
     }
 
-    It 'Reads SDK user exclusions for <Scenario> in <Representation>' -TestCases @(
-        @{ Scenario = 'ordinary exclusions'; Representation = 'SDK'; Designated = $false; Expected = 'Needs review' }
-        @{ Scenario = 'designated emergency exclusions'; Representation = 'SDK'; Designated = $true; Expected = 'Enforced' }
-        @{ Scenario = 'ordinary exclusions'; Representation = 'offline JSON'; Designated = $false; Expected = 'Needs review' }
-        @{ Scenario = 'designated emergency exclusions'; Representation = 'offline JSON'; Designated = $true; Expected = 'Enforced' }
+    It 'Reads SDK user exclusions for <Scenario> with <TypedValue> typed values in <Representation>' -TestCases @(
+        foreach ($representation in @('SDK', 'offline JSON')) {
+            foreach ($typedValue in @('null', 'empty')) {
+                @{ Scenario = 'ordinary exclusions'; Representation = $representation; TypedValue = $typedValue; Designated = $false; Expected = 'Needs review' }
+                @{ Scenario = 'designated emergency exclusions'; Representation = $representation; TypedValue = $typedValue; Designated = $true; Expected = 'Enforced' }
+            }
+        }
     ) {
-        param($Scenario, $Representation, $Designated, $Expected)
+        param($Scenario, $Representation, $TypedValue, $Designated, $Expected)
         $accountId = '10000000-0000-0000-0000-000000000001'
         $additional = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         $additional.Add('excludeUsers', @($accountId))
@@ -300,6 +394,7 @@ Describe 'State-aware Microsoft recommendation assessments' {
             IncludeUsers = @('All'); ExcludeUsers = $null; IncludeGroups = @(); ExcludeGroups = @()
             IncludeRoles = @(); ExcludeRoles = @(); AdditionalProperties = $additional
         }
+        if ($TypedValue -eq 'empty') { $policy.conditions.users.ExcludeUsers = @() }
         if ($Representation -eq 'offline JSON') { $policy = $policy | ConvertTo-Json -Depth 20 | ConvertFrom-Json }
         $emergencyIds = if ($Designated) { @($accountId) } else { @() }
 
@@ -520,6 +615,30 @@ Describe 'State-aware Microsoft recommendation assessments' {
         (Get-TestRecommendation 'CA-30').Evidence.Count | Should -Be 0
     }
 
+    It 'Keeps unverified SharePoint device scope partial for <Scenario>' -TestCases @(
+        @{ Scenario = 'compliant-only inclusion'; Devices = @{ deviceFilter = @{ mode = 'include'; rule = 'device.isCompliant -eq True' } } }
+        @{ Scenario = 'a complex filter'; Devices = @{ deviceFilter = @{ mode = 'exclude'; rule = 'device.isManaged -eq True -or device.trustType -eq "AzureAD"' } } }
+        @{ Scenario = 'a negative compliance filter'; Devices = @{ deviceFilter = @{ mode = 'include'; rule = 'device.isCompliant -ne True' } } }
+        @{ Scenario = 'a legacy device assignment'; Devices = @{ includeDevices = @('device-id') } }
+        @{ Scenario = 'an empty SDK device container'; Devices = [pscustomobject]@{ DeviceFilter = [pscustomobject]@{ Mode = $null; Rule = $null }; IncludeDevices = @(); ExcludeDevices = @() }; Expected = 'Matching policy enabled' }
+        @{ Scenario = 'no device condition'; Devices = $null; Expected = 'Matching policy enabled' }
+    ) {
+        param($Scenario, $Devices, $Expected = 'Partial match')
+        $policy.conditions.applications.includeApplications = @('00000003-0000-0ff1-ce00-000000000000')
+        $policy.conditions.clientAppTypes = @('browser')
+        $policy.conditions.devices = $Devices
+        $policy.sessionControls.applicationEnforcedRestrictions = @{ isEnabled = $true }
+
+        $result = Get-TestRecommendation 'CA-30'
+
+        $result.TemplateAssessment | Should -Be $Expected
+        $result.Assessment | Should -Be 'Needs review'
+        if ($Expected -eq 'Partial match') {
+            ($result.Evidence[0].Issues -join ' ') | Should -Match "Additional condition 'devices' limits coverage"
+        }
+        else { $result.Evidence[0].Issues.Count | Should -Be 0 }
+    }
+
     It 'Measures mandatory M365 mobile app protection and rejects device/legacy alternatives' {
         $policy.conditions.applications.includeApplications = @('Office365')
         $policy.conditions.platforms = @{ includePlatforms = @('android','iOS') }
@@ -690,7 +809,7 @@ Describe 'Named location inventory and rendering' {
         $ast.FindAll({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-            $node.Name -in @('Get-CaNamedLocationInventory', 'Get-NamedLocationHtmlFragment', 'Get-CaProperty', 'Write-Warn')
+            $node.Name -in @('Get-CaNamedLocationInventory', 'Get-NamedLocationHtmlFragment', 'Get-CaProperty', 'Test-CaConfiguredValue', 'Write-Warn')
         }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
         function Get-MgIdentityConditionalAccessNamedLocation { [CmdletBinding()] param([switch]$All) }
     }
@@ -1293,13 +1412,13 @@ Describe 'Get-NormalizedPolicyHash' {
 
 Describe 'Test-IsPhishResistantStrength' {
     BeforeAll {
-        function Test-IsPhishResistantStrength { param($Policy)
-            $strengthObj = $Policy.GrantControls.AuthenticationStrength
-            if (-not $strengthObj -or -not $strengthObj.AllowedCombinations) { return $false }
-            $nonPhish = @('deviceBasedPush','temporaryAccessPassOneTime','temporaryAccessPassMultiUse','microsoftAuthenticatorPush','sms','voice','softwareOath','hardwareOath','x509CertificateSingleFactor','federatedSingleFactor','qrCodePin')
-            $contains = ($strengthObj.AllowedCombinations | Where-Object { $nonPhish -contains $_ }).Count -gt 0
-            return (-not $contains)
-        }
+        $source = Get-Content -LiteralPath "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1" -Raw
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
+        $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+        $script:OfflineMode = $true
         # Prepare fake auth strength cache
         $script:AuthStrengthCache = @{}
         $script:AuthStrengthCachePopulated = $true
@@ -1347,15 +1466,14 @@ Describe 'CA Check Functions Representative Tests' {
 
     Context 'CA-05 Require Phish-Resistant MFA for Admins' {
         BeforeAll {
-            function Test-IsPhishResistantStrength { param($Policy)
-                $strengthObj = $Policy.GrantControls.AuthenticationStrength
-                if (-not $strengthObj -or -not $strengthObj.AllowedCombinations) { return $false }
-                $nonPhish = @('deviceBasedPush','temporaryAccessPassOneTime','temporaryAccessPassMultiUse','microsoftAuthenticatorPush','sms','voice','softwareOath','hardwareOath','x509CertificateSingleFactor','federatedSingleFactor','qrCodePin')
-                $contains = ($strengthObj.AllowedCombinations | Where-Object { $nonPhish -contains $_ }).Count -gt 0
-                return (-not $contains)
-            }
-            function Test-PolicyTargetsAdminRoles { param($Policy) if (-not $Policy -or -not $Policy.Conditions.Users.IncludeRoles) { return $false }; return ($Policy.Conditions.Users.IncludeRoles.Count -gt 0) }
-            function Test-PolicyRequiresPhishResistantMfaForAdmins { param($Policy) if (-not (Test-PolicyTargetsAdminRoles -Policy $Policy)) { return $false }; return (Test-IsPhishResistantStrength -Policy $Policy) }
+            $source = Get-Content -LiteralPath "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1" -Raw
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
+            $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+            }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+            $script:OfflineMode = $true
+            $script:RoleMap = @{ '62e90394-69f5-4237-9190-012177145e10' = 'Global Administrator' }
             # Ensure cache reflects phish-resistant combos only
             $script:AuthStrengthCache = @{ }
             $script:AuthStrengthCachePopulated = $true
