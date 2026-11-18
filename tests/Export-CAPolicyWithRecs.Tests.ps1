@@ -693,6 +693,11 @@ Describe 'Offline recommendation exports' {
         function Get-MgIdentityConditionalAccessNamedLocation { [CmdletBinding()] param([switch]$All, $NamedLocationId, $Property) }
         function Get-MgDirectoryRole { param([switch]$All) }
         function Get-MgRoleManagementDirectoryRoleDefinition { param([switch]$All, $Property) }
+        function Get-MgUser { [CmdletBinding()] param($UserId, $Property) }
+        function Get-MgGroup { [CmdletBinding()] param($GroupId, $Property) }
+        function Get-MgServicePrincipal { [CmdletBinding()] param($ServicePrincipalId, $Property) }
+        function Get-MgAgreement { [CmdletBinding()] param($AgreementId, $Property) }
+        function Get-MgPolicyAuthenticationStrengthPolicy { param([switch]$All, $Property) }
         $exportScript = "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1"
         $rawPath = Join-Path $TestDrive 'policies_raw.json'
         $basePolicy = @{
@@ -761,10 +766,24 @@ Describe 'Offline recommendation exports' {
         $html | Should -Match "id='panel-locations'"
     }
 
-    It 'Includes unreferenced tenant locations and resolves policy assignments in a connected HTML export' {
+    It 'Captures a portable snapshot during a <Mode> export and regenerates all formats on a clean offline process' -TestCases @(
+        @{ Mode = 'HTML'; IncludeHtml = $true }
+        @{ Mode = 'CSV-only'; IncludeHtml = $false }
+    ) {
+        param($Mode, $IncludeHtml)
         $livePolicies = Get-Content $rawPath -Raw | ConvertFrom-Json -AsHashtable
         $locationId = '44444444-4444-4444-4444-444444444444'
-        $livePolicies[0].conditions.locations = @{ includeLocations = @($locationId) }
+        $livePolicies[1].conditions.locations = @{ includeLocations = @($locationId) }
+        $livePolicies[1].conditions.users.includeUsers = @('66666666-6666-6666-6666-666666666666')
+        $livePolicies[1].conditions.users.includeGroups = @('77777777-7777-7777-7777-777777777777')
+        $livePolicies[1].conditions.users.includeRoles = @('62e90394-69f5-4237-9190-012177145e10')
+        $livePolicies[1].conditions.applications.includeApplications = @('88888888-8888-8888-8888-888888888888')
+        $livePolicies[1].grantControls.termsOfUse = @('99999999-9999-9999-9999-999999999999')
+        $livePolicies[0].grantControls.builtInControls = @()
+        $livePolicies[0].grantControls.authenticationStrength = @{ id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }
+        $livePolicies[2].conditions.AdditionalProperties = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $livePolicies[2].conditions.AdditionalProperties.Add('futureCondition', @{ value = 'restricted' })
+        $emergencyIds = @('10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002')
         Mock Get-PackageProvider { [pscustomobject]@{ Name = 'NuGet' } } -ParameterFilter { $Name -eq 'NuGet' }
         Mock Get-PSRepository { [pscustomobject]@{ InstallationPolicy = 'Trusted' } } -ParameterFilter { $Name -eq 'PSGallery' }
         Mock Get-Module { [pscustomobject]@{ Name = $Name } } -ParameterFilter { $Name -like 'Microsoft.Graph.*' }
@@ -776,21 +795,147 @@ Describe 'Offline recommendation exports' {
         Mock Get-MgIdentityConditionalAccessPolicy { $livePolicies }
         Mock Get-MgDirectoryRole { @() }
         Mock Get-MgRoleManagementDirectoryRoleDefinition { @() }
-        Mock Get-MgIdentityConditionalAccessNamedLocation {
-            @{ id = $locationId; displayName = 'Office & VPN'; '@odata.type' = '#microsoft.graph.ipNamedLocation'; isTrusted = $true; ipRanges = @(@{ cidrAddress = '192.0.2.0/24' }) }
-            @{ id = '55555555-5555-5555-5555-555555555555'; displayName = 'Unreferenced countries'; '@odata.type' = '#microsoft.graph.countryNamedLocation'; countriesAndRegions = @('US') }
+        Mock Get-MgUser { [pscustomobject]@{ DisplayName = 'Sample user' } }
+        Mock Get-MgGroup { [pscustomobject]@{ DisplayName = 'Sample group' } }
+        Mock Get-MgServicePrincipal { [pscustomobject]@{ DisplayName = 'Sample application' } }
+        Mock Get-MgAgreement { [pscustomobject]@{ DisplayName = 'Sample terms of use' } }
+        Mock Get-MgPolicyAuthenticationStrengthPolicy {
+            [pscustomobject]@{
+                Id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'; DisplayName = 'Custom sample strength'
+                AllowedCombinations = @('fido2'); RequirementsSatisfied = 'mfa'
+            }
         }
-        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'connected-html')
+        Mock Get-MgIdentityConditionalAccessNamedLocation {
+            [pscustomobject]@{
+                Id = $locationId; DisplayName = 'Office & VPN'; OdataType = '#microsoft.graph.ipNamedLocation'
+                AdditionalProperties = @{
+                    isTrusted = $false
+                    ipRanges = @(@{ cidrAddress = '192.0.2.0/24' }, @{ cidrAddress = '2001:db8::/32' })
+                }
+            }
+            [pscustomobject]@{
+                Id = '55555555-5555-5555-5555-555555555555'; DisplayName = 'Unreferenced countries'
+                AdditionalProperties = @{
+                    '@odata.type' = '#microsoft.graph.countryNamedLocation'; countriesAndRegions = @('US', 'CA')
+                    includeUnknownCountriesAndRegions = $false; countryLookupMethod = 'clientIpAddress'
+                }
+            }
+        }
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive "connected-$Mode")
 
-        & $exportScript -OutputPath $out.FullName -Html -NoBrowser
+        & $exportScript -OutputPath $out.FullName -Html:$IncludeHtml -Json:$IncludeHtml -Csv -CsvPivot:$IncludeHtml `
+            -NoRecommendations:(-not $IncludeHtml) -NoBrowser -EmergencyAccessAccountId $emergencyIds
 
-        $html = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
+        $snapshotPath = (Get-ChildItem $out.FullName -Filter '*_raw.json').FullName
+        $snapshot = Get-Content $snapshotPath -Raw | ConvertFrom-Json
+        [math]::Abs(([datetimeoffset]::UtcNow - [datetimeoffset]::Parse([string]$snapshot.CapturedAt)).TotalMinutes) |
+            Should -BeLessThan 2
+        $snapshot.Policies.Count | Should -Be 3
+        $snapshot.Policies[1].conditions.locations.includeLocations[0] | Should -Be $locationId
+        $snapshot.NamedLocations.Locations.Count | Should -Be 2
+        $snapshot.Lookups.Applications.'88888888-8888-8888-8888-888888888888' | Should -Be 'Sample application'
+        $snapshot.AuthenticationStrengths.Count | Should -Be 1
+        $snapshot.EmergencyAccessAccountIds | Should -Be $emergencyIds
+        if (-not $IncludeHtml) { @(Get-ChildItem $out.FullName -Filter '*.html').Count | Should -Be 0 }
+
+        $offlineDirectory = New-Item -ItemType Directory -Path (Join-Path $TestDrive "another-computer-$Mode")
+        $copiedInput = Join-Path $offlineDirectory.FullName 'copied-snapshot.json'
+        Copy-Item -LiteralPath $snapshotPath -Destination $copiedInput
+        $runner = Join-Path $TestDrive "offline-runner-$Mode.ps1"
+        @'
+param($Exporter, $Snapshot, $Destination)
+$ErrorActionPreference = 'Stop'
+Import-Module Microsoft.PowerShell.Utility, Microsoft.PowerShell.Management
+$PSModuleAutoLoadingPreference = 'None'
+& $Exporter -RawInputFile $Snapshot -OutputPath $Destination -Html -Json -Csv -CsvPivot -NoBrowser
+'@ | Set-Content -LiteralPath $runner
+        $processOutput = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -File $runner $exportScript $copiedInput $offlineDirectory.FullName 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($processOutput -join "`n")
+
+        $html = Get-Content -LiteralPath (Get-ChildItem $offlineDirectory.FullName -Filter '*.html').FullName -Raw
         $html | Should -Match 'Unreferenced countries'
         $html | Should -Match '192\.0\.2\.0/24'
+        $html | Should -Match '2001:db8::/32'
+        $html | Should -Match 'Not trusted'
+        $html | Should -Match 'Unknown countries/regions:</strong> Excluded'
+        $html | Should -Match 'clientIpAddress'
         $html | Should -Match '<td[^>]*>Office &amp; VPN</td>'
+        $html | Should -Match 'Sample user'
+        $html | Should -Match 'Sample group'
+        $html | Should -Match 'Global Administrator'
+        $html | Should -Match 'Sample terms of use'
+        $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-01'"
+        $html | Should -Match "data-assessment='needs-review'[^>]*id='rec-CA-13'"
+        $html | Should -Match 'CA Export v3\.7 - Synthetic tenant'
+        $html | Should -Match ([regex]::Escape("Snapshot captured: $($snapshot.CapturedAt)"))
         $html | Should -Not -Match 'not included in raw policy snapshots'
+        $connectedCsv = Get-ChildItem $out.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv'
+        $offlineCsv = Get-ChildItem $offlineDirectory.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv'
+        (Get-Content $offlineCsv.FullName -Raw) | Should -Be (Get-Content $connectedCsv.FullName -Raw)
+        if ($IncludeHtml) {
+            $connectedJson = Get-ChildItem $out.FullName -Filter '*.json' | Where-Object Name -NotLike '*_raw.json'
+            $offlineJson = Get-ChildItem $offlineDirectory.FullName -Filter '*.json' | Where-Object Name -NotLike 'copied-snapshot.json'
+            # Suggested names already contain a freshly randomized numeric prefix on every run.
+            $connectedPolicies = Get-Content $connectedJson.FullName -Raw | ConvertFrom-Json |
+                Select-Object * -ExcludeProperty 'Recommended Name' | ConvertTo-Json -Depth 12
+            $offlinePolicies = Get-Content $offlineJson.FullName -Raw | ConvertFrom-Json |
+                Select-Object * -ExcludeProperty 'Recommended Name' | ConvertTo-Json -Depth 12
+            $offlinePolicies | Should -Be $connectedPolicies
+            $connectedHtml = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
+            $connectedMfaCard = [regex]::Match($connectedHtml, "(?s)<details class='recommendation-card [^>]+id='rec-CA-01'.*?</details>").Value
+            $connectedMfaCard | Should -Match "data-assessment='enforced'"
+            [regex]::Matches($html, "<details class='recommendation-card [^>]+>").Value |
+                Should -Be ([regex]::Matches($connectedHtml, "<details class='recommendation-card [^>]+>").Value)
+        }
         Should -Invoke Get-MgIdentityConditionalAccessNamedLocation -Times 1 -Exactly -ParameterFilter { $All }
         Should -Invoke Get-MgIdentityConditionalAccessNamedLocation -Times 0 -ParameterFilter { $NamedLocationId }
+    }
+
+    It 'Preserves a <InventoryState> inventory and partial-export limits when regenerating a saved snapshot' -TestCases @(
+        @{ InventoryState = 'Available'; ExpectedMessage = 'No named locations are defined' }
+        @{ InventoryState = 'Failed'; ExpectedMessage = 'Saved collection failure &lt;detail&gt;' }
+    ) {
+        param($InventoryState, $ExpectedMessage)
+        $snapshotPath = Join-Path $TestDrive "partial-$InventoryState.json"
+        $saved = @{
+            SnapshotFormat = 'CAExportSnapshot'; SchemaVersion = 1
+            TenantName = 'Synthetic saved tenant'; CapturedAt = '2026-01-02 03:04:05Z'; PartialExport = $true
+            Policies = @($basePolicy)
+            NamedLocations = @{ Status = $InventoryState; Locations = @(); Message = 'Saved collection failure <detail>' }
+            Lookups = @{ Users = @{}; Groups = @{}; Roles = @{}; Applications = @{}; Locations = @{}; TermsOfUse = @{} }
+            AuthenticationStrengths = @(); EmergencyAccessAccountIds = @()
+        }
+        ConvertTo-Json -InputObject $saved -Depth 30 | Set-Content -LiteralPath $snapshotPath
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive "partial-report-$InventoryState")
+
+        & $exportScript -RawInputFile $snapshotPath -OutputPath $out.FullName -Html -NoBrowser
+
+        $html = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
+        $html | Should -Match $ExpectedMessage
+        $html | Should -Match 'Snapshot captured: 2026-01-02 03:04:05Z'
+        ([regex]::Matches($html, "data-assessment='needs-review'")).Count | Should -Be 32
+        $html | Should -Not -Match "data-attention='true' id='rec-CA-22'"
+        if ($InventoryState -eq 'Failed') { $html | Should -Not -Match 'No named locations are defined' }
+    }
+
+    It 'Rejects <InvalidInput> rather than rendering a misleading offline report' -TestCases @(
+        @{ InvalidInput = 'an unsupported snapshot version' }
+        @{ InvalidInput = 'an incomplete snapshot' }
+        @{ InvalidInput = 'enriched policy JSON' }
+        @{ InvalidInput = 'invalid JSON' }
+    ) {
+        param($InvalidInput)
+        $inputPath = Join-Path $TestDrive 'invalid-offline.json'
+        $content = switch ($InvalidInput) {
+            'an unsupported snapshot version' { '{"SnapshotFormat":"CAExportSnapshot","SchemaVersion":99}' }
+            'an incomplete snapshot' { '{"SnapshotFormat":"CAExportSnapshot","SchemaVersion":1,"Policies":[]}' }
+            'enriched policy JSON' { '[{"Name":"Sample policy","PolicyId":"11111111-1111-1111-1111-111111111111","Status":"Enabled"}]' }
+            'invalid JSON' { '{ not JSON' }
+        }
+        Set-Content -LiteralPath $inputPath -Value $content
+
+        { & $exportScript -RawInputFile $inputPath -OutputPath $TestDrive -Html -NoBrowser } |
+            Should -Throw '*Failed to load offline input*'
     }
 }
 
@@ -804,7 +949,7 @@ Describe 'User and group enrichment' {
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $helperNames
         }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
         $start = $source.IndexOf('# ---------------- Build lookup maps')
-        $end = $source.IndexOf('# ---------------- Construct CAExport')
+        $end = $source.IndexOf('# ---------------- Save portable snapshot')
         $enrich = [scriptblock]::Create($source.Substring($start, $end - $start))
 
         function Get-MgUser { [CmdletBinding()] param($UserId, $Property) }
@@ -887,14 +1032,18 @@ Describe 'User and group enrichment' {
         Should -Invoke Get-MgIdentityConditionalAccessNamedLocation -Times 1 -Exactly -ParameterFilter { $All }
     }
 
-    It 'Keeps per-ID location enrichment for exports without HTML' {
+    It 'Collects the full inventory for portable snapshots even without HTML' {
         $locIds = @('33333333-3333-3333-3333-333333333333')
-        Mock Get-MgIdentityConditionalAccessNamedLocation { [pscustomobject]@{ Id = $NamedLocationId; DisplayName = 'Office' } }
+        Mock Get-MgIdentityConditionalAccessNamedLocation {
+            [pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333'; DisplayName = 'Office' }
+            [pscustomobject]@{ Id = '44444444-4444-4444-4444-444444444444'; DisplayName = 'Unused office' }
+        }
 
         . $enrich
 
         $LocMap[$locIds[0]] | Should -Be 'Office'
-        Should -Invoke Get-MgIdentityConditionalAccessNamedLocation -Times 1 -Exactly -ParameterFilter { -not $All -and $NamedLocationId -eq $locIds[0] }
+        $NamedLocationInventory.Locations.Count | Should -Be 2
+        Should -Invoke Get-MgIdentityConditionalAccessNamedLocation -Times 1 -Exactly -ParameterFilter { $All }
     }
 }
 

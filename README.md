@@ -14,7 +14,8 @@ Two scripts are provided:
 
 * Automatic Microsoft Graph connection (Policy.Read.All, Directory.Read.All, RoleManagement.Read.All), with post-connect verification that all required scopes were granted.
 * Best-effort assignment enrichment: resolves users, groups, roles (active + template/definition), named locations, and terms of use; unresolved values retain their original IDs.
-* Offline mode (`-RawInputFile <policies-raw.json>`): regenerate reports and assessments from a raw Microsoft Graph policy array without signing in or making Graph calls. See [saving a raw snapshot](#saving-a-raw-snapshot).
+* Portable offline snapshots: every connected run automatically saves `*_raw.json` with raw policies, the complete Named Locations inventory, resolved assignment names, authentication-strength metadata, tenant/capture information, and designated emergency-account IDs.
+* Offline mode (`-RawInputFile <snapshot_raw.json>`): regenerate reports and assessments on another computer without signing in, installing Microsoft Graph modules, or making Graph calls. Legacy raw policy arrays remain supported. See [collect once and report offline](#collect-once-and-report-offline).
 
 * Interactive HTML report with tabbed layout:
 	* Summary (deployment metric cards, categorized inventory table with aligned values, percentage bars and explicit denominators, assessment snapshot)
@@ -112,6 +113,9 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 # All formats
 ./Export-CAPolicyWithRecs.ps1 -Html -Json -Csv -CsvPivot
 
+# Later, on another computer: copy the script and the generated *_raw.json snapshot
+./Export-CAPolicyWithRecs.ps1 -RawInputFile .\CAExportRecs_ExampleTenant_20261118_090000_raw.json -Html -NoBrowser
+
 # Identify designated emergency accounts for exclusion review (object IDs, not account names)
 ./Export-CAPolicyWithRecs.ps1 -Html -EmergencyAccessAccountId `
   '11111111-2222-3333-4444-555555555555','66666666-7777-8888-9999-000000000000'
@@ -125,9 +129,7 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 # Fast export (skip recommendations & omit tab)
 ./Export-CAPolicyWithRecs.ps1 -NoRecommendations
 
-# Offline (use a raw Graph policy snapshot; see the snapshot example below)
-#   - Skips Graph connection & enrichment queries
-#   - Still evaluates recommendations on provided raw policy array
+# Offline with a legacy raw Graph policy array (no saved locations or resolved names)
 ./Export-CAPolicyWithRecs.ps1 -RawInputFile .\policies-raw.json -Html -Json -NoBrowser
 ```
 
@@ -149,16 +151,16 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 | `CsvPivot` | Switch | Emit pivot‑friendly wide CSV. |
 | `CsvColumns` | String[] | Custom column subset/order for `-Csv`. |
 | `NoRecommendations` | Switch | Skip recommendation analysis & omit Recommendations tab (improves runtime in large tenants). |
-| `RawInputFile` | String (path) | Read a raw Graph policy object array (offline mode). Skips Graph authentication and enrichment; assessments use the supplied snapshot. |
-| `EmergencyAccessAccountId` | String[] (GUIDs) | Explicitly designated emergency-account object IDs for exclusion review. No account names or membership are guessed. |
+| `RawInputFile` | String (path) | Read a portable `*_raw.json` snapshot or legacy raw Graph policy array. Skips Graph authentication and queries; portable snapshots restore captured locations, names, and authentication strengths. |
+| `EmergencyAccessAccountId` | String[] (GUIDs) | Explicitly designated emergency-account object IDs for exclusion review. Saved in portable snapshots and restored offline unless this parameter is supplied to override them. No account names or membership are guessed. |
 
 If no export switch is specified, HTML, JSON, and CSV are produced automatically (pivot remains opt-in).
 
 ## Named Locations
 
-Connected HTML exports retrieve the complete tenant inventory with Graph pagination, including locations not referenced by the exported policies. The same inventory resolves policy location IDs without extra per-location queries. JSON/CSV-only exports retain their existing referenced-location enrichment.
+Every connected run retrieves the complete tenant inventory with Graph pagination, including locations not referenced by the exported policies, even for CSV/JSON-only exports or `-NoRecommendations`. The same inventory resolves policy location IDs without extra per-location queries and is saved in the portable snapshot.
 
-The Named Locations tab distinguishes an empty tenant inventory from retrieval failure. Offline policy snapshots do not contain location definitions, so the tab explicitly reports that the inventory is unavailable instead of claiming no locations exist. Location definitions do not change recommendation assessments or prove effective network access.
+The Named Locations tab distinguishes an empty tenant inventory from retrieval failure. Portable snapshots retain that distinction offline, along with IP ranges, trust settings, countries/regions, and lookup methods. Legacy policy-only arrays do not contain location definitions, so their offline reports explicitly show the inventory as unavailable. Location definitions do not change recommendation assessments or prove effective network access.
 
 Background and permissions: [Microsoft Entra network assignments](https://learn.microsoft.com/en-us/entra/identity/conditional-access/concept-assignment-network) and [Microsoft Graph list namedLocations](https://learn.microsoft.com/en-us/graph/api/conditionalaccessroot-list-namedlocations?view=graph-rest-1.0).
 
@@ -190,7 +192,7 @@ Each recommendation includes background, verification/remediation steps, require
 
 The Recommendations toolbar has four views: **Attention** (the default for new preferences), **All recommendations**, **Optional templates**, and **Operational reviews**. A separate **Assessment** dropdown optionally narrows the selected view; deployment-state filters remain in Policy Details. The visible count and empty-state message explain combined filters. Saved view/assessment choices persist, and previous status-button preferences migrate to the dropdown.
 
-This is a **configuration assessment, not an effective-access simulation or compliance certification**. Group/PIM membership, cross-tenant trust, combined coverage across multiple scoped policies, licensing, supporting application configuration, and actual sign-in outcomes are not verified. Exclusions other than supplied emergency-account IDs, restrictive/unknown conditions, and incomplete strength metadata yield `Needs review`. A `-PolicyID` export marks all recommendations `Needs review` because it is not a tenant-wide snapshot. Offline results describe only the supplied snapshot.
+This is a **configuration assessment, not an effective-access simulation or compliance certification**. Group/PIM membership, cross-tenant trust, combined coverage across multiple scoped policies, licensing, supporting application configuration, and actual sign-in outcomes are not verified. Exclusions other than supplied emergency-account IDs, restrictive/unknown conditions, and incomplete strength metadata yield `Needs review`. A `-PolicyID` export marks all recommendations `Needs review` because it is not a tenant-wide snapshot; this limitation is retained when its portable snapshot is loaded later. Offline results describe only the supplied snapshot, not current tenant configuration.
 
 Optional/business-specific controls (device-code dependencies, unmanaged-device restrictions, sessions, token protection, workloads, insider risk, and agents) stay `Needs review`, with observed evidence where available, rather than becoming universal failures. Agent policy coverage cannot be certified from the v1.0 export; delegated-agent use cannot be inferred from ordinary user MFA policies.
 
@@ -230,25 +232,37 @@ Microsoft guidance and prerequisite links were reviewed November 18, 2026. Licen
 |------|----------|
 | `*.html` | Self-contained report: Summary, Policy Details, Recommendations, and Named Locations. `-NoRecommendations` omits only Recommendations. |
 | `*.json` | Enriched policy objects; not suitable as a replacement for raw Graph policy input. |
+| `*_raw.json` | Portable, versioned offline snapshot, automatically saved on every connected run regardless of selected report formats. Includes raw policies, location inventory/status, name maps, authentication strengths, capture metadata, emergency-account IDs, and partial-export status. |
 | `*.csv` | Flat list (one row per policy). |
 | `*-pivot.csv` | Wide format for Excel / BI pivoting. |
 
 HTML reports need no companion images, CSS, JavaScript downloads, or web server. The images in this README are documentation assets only.
 
-### Saving a raw snapshot
+### Collect once and report offline
 
-The full script currently writes enriched JSON, not an additional raw snapshot. To save raw input for offline regeneration, first connect with the required Graph scopes (for example, run a connected export), then save the policy array explicitly:
+**On the connected computer**, run the full script once with the required Graph permissions:
 
 ```powershell
-$policies = @(Get-MgIdentityConditionalAccessPolicy -All `
-  -Headers @{ Prefer = 'include-unknown-enum-members' } -ErrorAction Stop)
-ConvertTo-Json -InputObject $policies -Depth 30 |
-  Set-Content -LiteralPath .\policies-raw.json -Encoding utf8
-
-./Export-CAPolicyWithRecs.ps1 -RawInputFile .\policies-raw.json -Html -NoBrowser
+./Export-CAPolicyWithRecs.ps1 -Html -Json -Csv -NoBrowser
 ```
 
-Real exports and raw snapshots can contain sensitive identity, application, and network information. Review them before sharing; do not commit tenant reports or snapshots to a public repository. Raw policy snapshots do not include directory-name lookups or named-location definitions.
+Alongside the requested reports, this automatically creates a timestamped file such as `CAExportRecs_ExampleTenant_20261118_090000_raw.json`. No second collection command is needed. This snapshot is a versioned object containing a `Policies` array and supporting data, not a bare Graph policy array.
+
+**Copy only the snapshot and `Export-CAPolicyWithRecs.ps1` to the other computer.** No sidecar files or Microsoft Graph modules are needed there. With PowerShell available, regenerate any report formats:
+
+```powershell
+./Export-CAPolicyWithRecs.ps1 `
+  -RawInputFile .\CAExportRecs_ExampleTenant_20261118_090000_raw.json `
+  -Html -Json -Csv -CsvPivot -NoBrowser
+```
+
+The report restores the captured tenant name, resolved names, location definitions, and custom authentication-strength data. Its header identifies the original snapshot capture time. Rerunning does not refresh tenant data or contact Graph, and does not create another snapshot. Use a new connected run when current data is needed.
+
+Collection failures remain visible: a failed location query is saved as failed, not as an empty inventory; unresolved names retain their IDs. If a location/name/strength lookup failed during collection, offline replay cannot recover that missing data. Review collection warnings before transferring the snapshot; use `-Verbose` for additional lookup diagnostics. Snapshot-writing failures terminate the run rather than silently leaving you without reusable collection data.
+
+Legacy raw policy arrays still work with `-RawInputFile`, but cannot restore data they never contained. Enriched `*.json` output is not valid offline input. Unknown snapshot schema versions and malformed input are rejected explicitly.
+
+Real exports and snapshots can contain sensitive identity, application, and network information. Transfer and store them securely; do not commit tenant reports or snapshots to a public repository. Snapshot collection does not save Graph access tokens or sign-in credentials.
 
 ---
 ## Troubleshooting
@@ -258,9 +272,9 @@ Real exports and raw snapshots can contain sensitive identity, application, and 
 | Missing consent or empty policy list | Confirm Policy.Read.All, Directory.Read.All, RoleManagement.Read.All, and an appropriate Entra read role. Required scopes alone do not grant directory roles. Review the connection/API error before retrying. |
 | Unresolved user/group/role IDs | Review lookup warnings, granted permissions, and whether the referenced object still exists. Unresolved IDs are retained rather than replaced with blank or guessed names. |
 | More assessments need review than expected | Read the matching evidence and scope caveats. Exclusions, restricted conditions, incomplete metadata, and single-policy snapshots can require review without proving the policy ineffective. Optional applicability reviews are separate from Attention. |
-| Named Locations unavailable offline | Expected: raw policy arrays contain location IDs, not definitions. Use a connected HTML export for the complete location inventory. |
+| Named Locations unavailable offline | Use the automatically generated portable `*_raw.json`, not a legacy policy-only array. If the saved inventory reports a collection failure, resolve that error and collect a new snapshot while connected. |
 | CSV warning about `NoTypeInformation` | Use the updated full exporter, which no longer passes the obsolete parameter. CSV output still contains headers and data without type-information rows. |
-| Offline mode shows fewer enriched names | `-RawInputFile` skips live resolution; rerun without offline mode for fresh enrichment. |
+| Offline mode shows fewer enriched names | Portable snapshots restore names resolved during collection. Legacy arrays or failed lookups retain IDs; resolve collection warnings and collect again while connected. |
 
 ---
 ## Contributing
@@ -277,6 +291,7 @@ PRs welcome. Please:
 
 | Version | Highlights |
 |---------|-----------|
+| 3.7 | Automatic portable offline snapshots on every connected run, including complete Named Locations, resolved names, authentication strengths, capture metadata, emergency-account IDs, and partial-export limits; backward-compatible policy-array loading and explicit snapshot validation. |
 | 3.6 | Paginated Named Locations inventory with explicit offline/failure states; post-connect scope verification; four recommendation views plus an Assessment dropdown and preference migration; improved Summary formatting; removed obsolete CSV parameter warnings. |
 | 3.5 | Fixed false restrictions from empty Graph SDK models and separated optional applicability reviews from Attention; four application-scoped templates with match/deployment measurements and resource/filter evidence; refreshed all tabs with responsive light/dark layouts, contained sticky scrolling and combined filters. |
 | 3.4 | 28 Microsoft-backed recommendation assessments with state/scope/grant-aware evaluation, prerequisites/background links, escaped evidence, emergency-account IDs, and optional advanced-scenario reviews. |

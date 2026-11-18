@@ -16,6 +16,11 @@
 .PARAMETER Json
   Switch. Generate a JSON file containing the enriched policy objects.
 
+.PARAMETER RawInputFile
+  Path to a portable *_raw.json snapshot from a connected run, or a legacy raw Graph policy array.
+  Portable snapshots restore named locations, resolved names, authentication strengths, and capture metadata
+  without Microsoft Graph modules, a connection, or network access.
+
 .PARAMETER Csv
   Switch. Generate a flattened CSV export of the policy objects suitable for spreadsheet review.
 
@@ -67,7 +72,7 @@ This example runs the script and exports all Conditional Access policies with re
 
 .NOTES
   Author:  Douglas Baker @dougsbaker
-  Version: 3.6
+  Version: 3.7
 
 ############################################################################
 This sample script is not supported under any standard support program or service.
@@ -85,7 +90,7 @@ param (
   [Parameter()]
   [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
   [String]$PolicyID,
-  [Parameter(HelpMessage = 'Path to previously exported *_raw.json to operate offline (skips Graph calls).')]
+  [Parameter(HelpMessage = 'Path to a portable *_raw.json snapshot or legacy raw policy array (skips Graph calls).')]
   [ValidateScript({ Test-Path $_ -PathType Leaf })]
   [string]$RawInputFile,
   [switch]$Html,
@@ -539,7 +544,7 @@ function Get-CaNamedLocationInventory {
   if ($Offline) {
     return [pscustomobject]@{
       Status = 'Offline'; Locations = @()
-      Message = 'Named location definitions are not included in raw policy snapshots. Run a connected HTML export to retrieve IP ranges and countries/regions.'
+      Message = 'Named location definitions are not included in raw policy snapshots from legacy policy-only exports. Use a portable *_raw.json snapshot from a connected run to include IP ranges and countries/regions offline.'
     }
   }
   try {
@@ -550,6 +555,60 @@ function Get-CaNamedLocationInventory {
     $message = 'Could not retrieve named locations: {0}' -f $_.Exception.Message
     Write-Warn $message
     return [pscustomobject]@{ Status = 'Failed'; Locations = @(); Message = $message }
+  }
+}
+
+function Import-CaSnapshot {
+  <#
+  .SYNOPSIS
+    Read a portable snapshot or a legacy raw Graph policy array without calling Graph.
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Path)
+
+  try {
+    $data = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop |
+      ConvertFrom-Json -Depth 100 -NoEnumerate -ErrorAction Stop
+    if ($data.PSObject.Properties['SnapshotFormat']) {
+      if ($data.SnapshotFormat -ne 'CAExportSnapshot' -or $data.SchemaVersion -ne 1) {
+        throw 'Unsupported snapshot format or schema version. Use a compatible exporter version.'
+      }
+      foreach ($field in @('TenantName', 'CapturedAt', 'PartialExport', 'Policies', 'NamedLocations', 'Lookups', 'AuthenticationStrengths', 'EmergencyAccessAccountIds')) {
+        if (-not $data.PSObject.Properties[$field]) { throw "Snapshot is missing required field '$field'." }
+      }
+      $capturedAt = [datetimeoffset]::MinValue
+      if ([string]::IsNullOrWhiteSpace($data.TenantName) -or
+          -not [datetimeoffset]::TryParse([string]$data.CapturedAt, [ref]$capturedAt) -or
+          $data.PartialExport -isnot [bool] -or $data.Policies -isnot [array] -or
+          $data.AuthenticationStrengths -isnot [array] -or $data.EmergencyAccessAccountIds -isnot [array]) {
+        throw 'Snapshot metadata or collections are invalid.'
+      }
+      if ($data.NamedLocations.Status -notin @('Available', 'Failed', 'Offline') -or
+          $data.NamedLocations.Locations -isnot [array]) {
+        throw 'Snapshot named-location inventory is invalid.'
+      }
+      foreach ($name in @('Users', 'Groups', 'Roles', 'Applications', 'Locations', 'TermsOfUse')) {
+        if ($data.Lookups.$name -isnot [pscustomobject]) { throw "Snapshot lookup map '$name' is invalid." }
+      }
+      $policies = @($data.Policies)
+    }
+    else {
+      $policies = @($data)
+      $data = [pscustomobject]@{
+        Policies = $policies; TenantName = 'OfflineTenant'; CapturedAt = (Get-Date).ToUniversalTime().ToString('u')
+        PartialExport = $false
+      }
+    }
+    if (-not $policies.Count) { throw 'The input contains no policies.' }
+    foreach ($policy in $policies) {
+      if (-not $policy.id -or -not $policy.PSObject.Properties['conditions']) {
+        throw 'Expected raw Graph policies, not enriched policy JSON.'
+      }
+    }
+    return $data
+  }
+  catch {
+    throw ("Failed to load offline input '{0}': {1}" -f $Path, $_.Exception.Message)
   }
 }
 
@@ -785,7 +844,9 @@ function Initialize-AuthStrengthCache {
     $script:AuthStrengthCachePopulated = $true
     return
   }
-  $strengths = Invoke-SafeGet { Get-MgPolicyAuthenticationStrengthPolicy -All -Property Id, DisplayName, AllowedCombinations }
+  $strengths = Invoke-SafeGet -FailureMessage 'Could not retrieve authentication strengths; custom-strength assessments may require review' {
+    Get-MgPolicyAuthenticationStrengthPolicy -All -Property Id, DisplayName, AllowedCombinations
+  }
   if ($strengths) {
     foreach ($s in $strengths) {
       if ($s.Id) { $script:AuthStrengthCache[$s.Id] = $s }
@@ -797,12 +858,14 @@ function Initialize-AuthStrengthCache {
 
 function Get-AssignedAuthStrengthObject {
   param($Policy)
-  if (-not $Policy -or -not $Policy.GrantControls.AuthenticationStrength) { return $null }
+  $as = Get-CaProperty $Policy 'grantControls.authenticationStrength'
+  if (-not $as) { return $null }
   Initialize-AuthStrengthCache
-  $as = $Policy.GrantControls.AuthenticationStrength
-  if ($as.AllowedCombinations -or $as.RequirementsSatisfied) { return $as }
-  if ($as.Id -and $script:AuthStrengthCache.ContainsKey($as.Id)) { return $script:AuthStrengthCache[$as.Id] }
-  if ($as.DisplayName -and $script:AuthStrengthCache.ContainsKey($as.DisplayName)) { return $script:AuthStrengthCache[$as.DisplayName] }
+  if ((Get-CaProperty $as 'allowedCombinations') -or (Get-CaProperty $as 'requirementsSatisfied')) { return $as }
+  $id = [string](Get-CaProperty $as 'id')
+  $name = [string](Get-CaProperty $as 'displayName')
+  if ($id -and $script:AuthStrengthCache.ContainsKey($id)) { return $script:AuthStrengthCache[$id] }
+  if ($name -and $script:AuthStrengthCache.ContainsKey($name)) { return $script:AuthStrengthCache[$name] }
   return $null 
 }
 
@@ -957,7 +1020,10 @@ function Get-CaProperty {
   foreach ($name in $Path.Split('.')) {
     if ($null -eq $value) { return }
     $next = if ($value -is [System.Collections.IDictionary]) { $value[$name] } else { $value.PSObject.Properties[$name].Value }
-    if ($null -eq $next -and $value.AdditionalProperties) { $next = $value.AdditionalProperties[$name] }
+    if ($null -eq $next -and $value.AdditionalProperties) {
+      $additional = $value.AdditionalProperties
+      $next = if ($additional -is [System.Collections.IDictionary]) { $additional[$name] } else { $additional.PSObject.Properties[$name].Value }
+    }
     $value = $next
   }
   if ($null -ne $value) { return $value }
@@ -1254,7 +1320,10 @@ function Get-CaPolicyReviewReason {
   if ($Recommendation.Resources -notin @('Registration','DeviceRegistration') -and (@(Get-CaProperty $apps 'includeUserActions').Count -or @(Get-CaProperty $apps 'includeAuthenticationContextClassReferences').Count)) { 'A user-action or authentication-context policy does not prove broad resource coverage.' }
   $allowed = @('users','applications','clientAppTypes') + @($Recommendation.AllowedConditions)
   $conditionNames = if ($conditions -is [System.Collections.IDictionary]) { @($conditions.Keys) } else { @($conditions.PSObject.Properties.Name) }
-  if ($conditions.AdditionalProperties) { $conditionNames += @($conditions.AdditionalProperties.Keys) }
+  $additional = $conditions.AdditionalProperties
+  if ($additional) {
+    $conditionNames += if ($additional -is [System.Collections.IDictionary]) { @($additional.Keys) } else { @($additional.PSObject.Properties.Name) }
+  }
   foreach ($name in ($conditionNames | Sort-Object -Unique)) {
     if ($name -in $allowed -or $name -in @('AdditionalProperties','@odata.type')) { continue }
     $value = Get-CaProperty $conditions $name
@@ -1398,6 +1467,10 @@ Set-Alias -Name Translate-List -Value Convert-IdListToName -ErrorAction Silently
 
 # Determine offline mode early so we can skip any Graph interaction
 $script:OfflineMode = [bool]$RawInputFile
+$script:AuthStrengthCache = @{}
+$script:AuthStrengthCachePopulated = $false
+$OfflineSnapshot = $null
+$IsPartialSnapshot = [bool]$PolicyID
 if (-not $script:OfflineMode) {
   # Ensure required modules are present before attempting to connect
   Initialize-GraphModule
@@ -1408,7 +1481,7 @@ else {
 }
 
 # Script metadata / version stamp (bump when feature changes)
-$Script:CAExportVersion = '3.6'
+$Script:CAExportVersion = '3.7'
 
 # Map external switch parameters to internal export control flags for backward compatibility / clarity
 if ($PSBoundParameters.ContainsKey('Html')) {
@@ -1449,34 +1522,34 @@ if (-not $ExportLocation) {
 
 # ---------------- Retrieve Tenant & Policies ----------------
 if ($RawInputFile) {
-  Write-Info "Offline mode: importing raw policy JSON from $RawInputFile"
-  try {
-    $rawText = Get-Content -LiteralPath $RawInputFile -Raw -ErrorAction Stop
-    $allPolicies = $rawText | ConvertFrom-Json -ErrorAction Stop
+  Write-Info "Offline mode: importing snapshot or raw policy JSON from $RawInputFile"
+  $OfflineSnapshot = Import-CaSnapshot -Path $RawInputFile
+  $allPolicies = @($OfflineSnapshot.Policies)
+  $TenantName = $OfflineSnapshot.TenantName
+  $Date = $OfflineSnapshot.CapturedAt
+  $IsPartialSnapshot = $IsPartialSnapshot -or $OfflineSnapshot.PartialExport
+  if (-not $PSBoundParameters.ContainsKey('EmergencyAccessAccountId')) {
+    $EmergencyAccessAccountId = @($OfflineSnapshot.EmergencyAccessAccountIds | Where-Object { $_ })
   }
-  catch {
-    Write-Err ("Failed to read or parse RawInputFile '{0}': {1}" -f $RawInputFile, $_.Exception.Message)
-    exit 1
+  foreach ($strength in $OfflineSnapshot.AuthenticationStrengths) {
+    if ($strength.Id) { $script:AuthStrengthCache[$strength.Id] = $strength }
+    if ($strength.DisplayName) { $script:AuthStrengthCache[$strength.DisplayName] = $strength }
   }
-  if (-not $allPolicies) {
-    Write-Err 'Parsed zero policies from provided raw file. Exiting.'
-    exit 1
-  }
-  $TenantName = 'OfflineTenant'
-  $Date = (Get-Date).ToString('u')
+  $script:AuthStrengthCachePopulated = $true
   if ($PolicyID) {
     $CAPolicy = @($allPolicies | Where-Object { $_.id -eq $PolicyID })
   }
   else {
     $CAPolicy = @($allPolicies)
   }
+  if (-not $CAPolicy.Count) { throw "Policy with ID '$PolicyID' was not found in the offline input." }
   Write-Info "Loaded $($CAPolicy.Count) policies from raw file"
 }
 else {
   Write-Info 'Retrieving tenant information'
   $TenantName = (Get-MgOrganization -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DisplayName)
   if (-not $TenantName) { $TenantName = 'UnknownTenant' }
-  $Date = (Get-Date).ToString('u')
+  $Date = (Get-Date).ToUniversalTime().ToString('u')
   Write-Info 'Retrieving Conditional Access policies'
   try {
     $allPolicies = Get-MgIdentityConditionalAccessPolicy -All -Headers @{ Prefer = 'include-unknown-enum-members' } -ErrorAction Stop
@@ -1550,10 +1623,22 @@ foreach ($p in $CAPolicy) {
 
 # ---------------- Build lookup maps (best-effort) ----------------
 $UserMap = @{}; $GroupMap = @{}; $RoleMap = @{}; $AppMap = @{}; $LocMap = @{}; $TouMap = @{}
-$NamedLocationInventory = if ($HTMLExport) { Get-CaNamedLocationInventory -Offline:$script:OfflineMode }
+$NamedLocationInventory = if ($script:OfflineMode -and $OfflineSnapshot.NamedLocations) {
+  $OfflineSnapshot.NamedLocations
+}
+else { Get-CaNamedLocationInventory -Offline:$script:OfflineMode }
 
 if ($script:OfflineMode) {
-  Write-Info 'Offline mode: skipping user/group/role/app/location/TOU Graph enrichment.'
+  Write-Info 'Offline mode: restoring saved lookup maps without Graph calls; unresolved IDs remain unchanged.'
+  foreach ($entry in @{
+    Users = $UserMap; Groups = $GroupMap; Roles = $RoleMap
+    Applications = $AppMap; Locations = $LocMap; TermsOfUse = $TouMap
+  }.GetEnumerator()) {
+    $savedMap = $OfflineSnapshot.Lookups.($entry.Key)
+    if ($savedMap) {
+      foreach ($property in $savedMap.PSObject.Properties) { $entry.Value[$property.Name] = $property.Value }
+    }
+  }
 }
 else {
   foreach ($id in $userIds) {
@@ -1655,6 +1740,28 @@ else {
       if ($obj) { $TouMap[$id] = $obj.DisplayName }
     }
   }
+}
+
+# ---------------- Save portable snapshot ----------------
+# Save collection data before rendering so it remains reusable even if a report export fails.
+$baseName = "CAExportRecs_${TenantName}_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+if (-not $script:OfflineMode) {
+  Initialize-AuthStrengthCache
+  $snapshot = [ordered]@{
+    SnapshotFormat = 'CAExportSnapshot'; SchemaVersion = 1; ExporterVersion = $CAExportVersion
+    TenantName = $TenantName; CapturedAt = $Date; PartialExport = $IsPartialSnapshot
+    Policies = @($CAPolicy); NamedLocations = $NamedLocationInventory
+    Lookups = [ordered]@{
+      Users = $UserMap; Groups = $GroupMap; Roles = $RoleMap
+      Applications = $AppMap; Locations = $LocMap; TermsOfUse = $TouMap
+    }
+    AuthenticationStrengths = @($script:AuthStrengthCache.Values | Sort-Object Id -Unique)
+    EmergencyAccessAccountIds = @($EmergencyAccessAccountId | Where-Object { $_ })
+  }
+  $snapshotFile = Join-Path -Path $ExportLocation -ChildPath "${baseName}_raw.json"
+  ConvertTo-Json -InputObject $snapshot -Depth 100 -WarningAction Stop |
+    Set-Content -LiteralPath $snapshotFile -Encoding utf8 -ErrorAction Stop
+  Write-Info "Portable offline snapshot saved: $snapshotFile"
 }
 
 # ---------------- Construct CAExport ----------------
@@ -1788,7 +1895,6 @@ foreach ($Policy in $CAPolicy) {
 }
 
 $LinkURL = 'https://entra.microsoft.com/#view/Microsoft_AAD_ConditionalAccess/PolicyBlade/policyId/'
-$baseName = "CAExportRecs_${TenantName}_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 $FileName = "$baseName.html"
 $JsonFileName = "$baseName.json"
 $CsvFileName = "$baseName.csv"
@@ -1796,7 +1902,7 @@ $CsvPivotFileName = "$baseName-pivot.csv"
 $HtmlParts = @()
 if (-not $NoRecommendations) {
   Write-Info 'Analyzing: getting recommendations'
-  $recommendations = @(Get-CaRecommendationResult -Policies @($CAPolicy) -EmergencyAccessAccountId $EmergencyAccessAccountId -PartialExport:([bool]$PolicyID))
+  $recommendations = @(Get-CaRecommendationResult -Policies @($CAPolicy) -EmergencyAccessAccountId $EmergencyAccessAccountId -PartialExport:$IsPartialSnapshot)
 }
 
 ## (Removed obsolete Set Row Order block)
@@ -1966,8 +2072,10 @@ function Get-NamedLocationHtmlFragment {
   foreach ($location in ($locations | Sort-Object DisplayName)) {
     $type = [string](Get-CaProperty $location 'OdataType')
     if (-not $type) { $type = [string]$location.'@odata.type' }
-    $additional = Get-CaProperty $location 'AdditionalProperties'
-    if (-not $type -and $additional) { $type = [string]$additional['@odata.type'] }
+    if (-not $type) {
+      $additional = Get-CaProperty $location 'AdditionalProperties'
+      $type = if ($additional -is [System.Collections.IDictionary]) { [string]$additional['@odata.type'] } else { [string]$additional.'@odata.type' }
+    }
     $name = [string](Get-CaProperty $location 'displayName')
     if ([string]::IsNullOrWhiteSpace($name)) { $name = '(Unnamed location)' }
     $safeName = [System.Web.HttpUtility]::HtmlEncode($name)
@@ -2297,6 +2405,8 @@ if ($HTMLExport) {
 '@
 
   $safeTenantName = [System.Web.HttpUtility]::HtmlEncode($TenantName)
+  $reportDateText = if ($OfflineSnapshot.SnapshotFormat) { "Snapshot captured: $Date" } else { $Date }
+  $safeReportDate = [System.Web.HttpUtility]::HtmlEncode($reportDateText)
   $htmlDoc = @"
 <!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
 <script>
@@ -2308,7 +2418,7 @@ if ($HTMLExport) {
 </script>
 <style>$style</style><title>CA Export v$CAExportVersion - $safeTenantName</title></head><body>
 <nav class='navbar-custom' aria-label='Conditional Access report'>
-  <div class='nav-heading'><div class='brand'>CA Export $CAExportVersion</div><div class='nav-center'>$safeTenantName</div><div class='nav-right'>$Date</div></div>
+  <div class='nav-heading'><div class='brand'>CA Export $CAExportVersion</div><div class='nav-center'>$safeTenantName</div><div class='nav-right'>$safeReportDate</div></div>
   <div class='view-toggle-group' role='tablist' aria-label='Report view'>$reportTabs</div>
 </nav>$OmissionBannerHtml
 <div id='live-region' class='visually-hidden' aria-live='polite' aria-atomic='true'></div><button type='button' id='back-to-top' aria-label='Back to top' title='Back to top'>&uarr;</button>
@@ -3040,7 +3150,7 @@ document.addEventListener('DOMContentLoaded', function(){
   }
 }
 if ($JsonExport) {
-  Write-Info 'Saving to File: JSON (enriched policies) & RAW JSON'
+  Write-Info 'Saving to File: JSON (enriched policies)'
   $LaunchJson = Join-Path -Path $ExportLocation -ChildPath $JsonFileName
   try {
     $CAExport | ConvertTo-Json -Depth 12 | Out-File $LaunchJson
@@ -3048,15 +3158,6 @@ if ($JsonExport) {
   }
   catch {
     Write-Warn "Failed to save enriched JSON: $_" 
-  }
-  if ($RawPolicyObjects) {
-    $rawFile = Join-Path -Path $ExportLocation -ChildPath "${baseName}_raw.json"
-    try {
-      $RawPolicyObjects | ConvertTo-Json -Depth 12 | Out-File $rawFile; Write-Info "Raw JSON saved: $rawFile" 
-    }
-    catch {
-      Write-Warn "Failed to save raw JSON: $_" 
-    }
   }
 }
 if ($CsvExport) {
