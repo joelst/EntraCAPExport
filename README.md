@@ -6,16 +6,15 @@ Two scripts are provided:
 
 | Script | Purpose |
 |--------|---------|
-| `Export-CAPolicy.ps1` | Lightweight export – single HTML table of policies. |
-| `Export-CAPolicyWithRecs.ps1` | Full featured export – enrichment, recommendations, duplicate detection, multiple output formats, interactive HTML UI. |
+| `Export-CaPolicy.ps1` | Lightweight export – single HTML table of policies. |
+| `Export-CAPolicyWithRecs.ps1` | Full export – identity enrichment, 32 recommendation/template assessments, Named Locations, multiple output formats, and an interactive HTML report. |
 
 ---
 ## Key Features (Full Export Script)
 
 * Automatic Microsoft Graph connection (Policy.Read.All, Directory.Read.All, RoleManagement.Read.All), with post-connect verification that all required scopes were granted.
-* Policy enrichment: resolves Users, Groups, Roles (active + template/definition), Service Principals, Named Locations, Terms of Use.
-* Duplicate policy detection (normalized JSON → SHA256 hash) with cross‑reference listing.
-* Offline re‑hydration mode (`-RawInputFile <*_raw.json>`): regenerate HTML / CSV / recommendations from a prior raw snapshot without calling Microsoft Graph.
+* Best-effort assignment enrichment: resolves users, groups, roles (active + template/definition), named locations, and terms of use; unresolved values retain their original IDs.
+* Offline mode (`-RawInputFile <policies-raw.json>`): regenerate reports and assessments from a raw Microsoft Graph policy array without signing in or making Graph calls. See [saving a raw snapshot](#saving-a-raw-snapshot).
 
 * Interactive HTML report with tabbed layout:
 	* Summary (deployment metric cards, categorized inventory table with aligned values, percentage bars and explicit denominators, assessment snapshot)
@@ -23,26 +22,61 @@ Two scripts are provided:
 	* Recommendations (32 assessments, four purpose-based views, a separate assessment dropdown, prerequisites, background, Microsoft links, and policy evidence)
 	* Named Locations (all tenant definitions, IPv4/IPv6 ranges, trusted flags, countries/regions, unknown-area handling, lookup method, IDs and timestamps)
 * Consistent spacing, readable typography, responsive cards/navigation, and automatic light/dark styling across all tabs (`?scoutTheme=light` or `?scoutTheme=dark` overrides the system theme)
-* Overlap legend chip & row highlighting: quickly filter policies where include/exclude sets intersect (potentially nullifying scope)
+* Exact include/exclude overlap assessment with matching policy evidence
 * Authentication-strength assessment uses known built-in IDs or verified method combinations, not display-name guesses
 * Enhanced admin role detection: resolves active roles, template IDs, and role definition IDs (GUID → name) before MFA checks
-* Legend / utility bar (status badges, recommendation icons, boolean toggle, ID column toggle)
-* Layout toggle (dynamic natural column widths vs fixed legacy widths)
+* Legend / utility bar with deployment badges and a boolean display toggle
 * Boolean display toggle (icons ✔/— or text True/False)
 * Description clamp (expand/collapse with accessible aria attributes)
 * Per‑policy original vs mutated JSON toggle + Copy JSON button (clipboard)
-* Preference persistence (remembers active tab, boolean mode, ID column visibility, recommendation view and assessment filter)
+* Preference persistence (remembers active tab, boolean mode, policy deployment filter, recommendation view and assessment filter)
 * Accessibility: keyboard‑navigable tabs, aria-live announcements (copy feedback), sticky headers, focusable controls
 * CSV (long), CSV Pivot (wide) and JSON export options
-* Duplicate detection, role/name resolution, risk & device metrics in Summary
-* Optional fast mode: `-NoRecommendations` skips recommendation analysis (faster, omits Recommendations tab & related JavaScript/state)
+* Deployment, authentication, device, risk, and administrator metrics in Summary
+* Optional fast mode: `-NoRecommendations` skips assessments and omits the Recommendations tab; Summary, Policy Details, and Named Locations remain available
 * Inline recommendation catalog (no external data file dependency) with escaped policy evidence
 
-Screenshots:
-![Recommendations Tab](./images/CaExport-rec.png)
-![Results Table](./images/CaExport-result.png)
-![Duplicate Highlighting](./images/CAExport-Select.png)
-![Summary Table](./images/CaExport-summary.png)
+## Screenshots — sample data only
+
+These captures show version 3.6 using **Contoso Demo (sample data)**. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
+
+The sample policies illustrate report behavior, **not a recommended production baseline**. Both light and dark themes are shown.
+
+<details open>
+<summary><strong>Summary</strong> — deployment cards, grouped inventory, and assessment counts</summary>
+
+![Sample Summary tab with deployment totals, categorized metrics, and assessment counts](./images/report-summary.png)
+
+</details>
+
+<details>
+<summary><strong>Policy Details</strong> — sample assignments, deployment tags, and contained table scrolling</summary>
+
+![Sample Policy Details tab with resolved example identities and deployment-state tags](./images/report-policies.png)
+
+</details>
+
+<details>
+<summary><strong>Recommendations</strong> — four purpose-based views and the separate Assessment dropdown</summary>
+
+![Sample Recommendations tab with Attention, All recommendations, Optional templates, and Operational reviews](./images/report-recommendations.png)
+
+</details>
+
+<details>
+<summary><strong>Optional templates</strong> — expanded Microsoft 365 unmanaged-device guidance and prerequisites</summary>
+
+![Sample Microsoft 365 unmanaged-device template with configuration guidance, requirements, and Microsoft links](./images/report-optional-templates.png)
+
+</details>
+
+<details>
+<summary><strong>Named Locations</strong> — sample IPv4/IPv6 ranges, trust settings, and countries/regions</summary>
+
+![Sample Named Locations tab using reserved documentation IP ranges and fictional location definitions](./images/report-named-locations.png)
+
+</details>
+
 ---
 ## Installation / Prereqs
 
@@ -68,8 +102,6 @@ When the script runs it will request admin consent to allow it to use the Micros
 
 After sign-in or reconnection, the script reads the new Graph context and stops if the authenticated account or any required scope is missing. This verifies granted scopes, not the account's Entra role or access to every individual resource; API failures still surface separately.
 
-![Requesting Admin Consent for Graph Command Line Tools ](./images/MicrosoftGraphConsent.png)
-
 ---
 ## Quick Start
 
@@ -93,10 +125,10 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 # Fast export (skip recommendations & omit tab)
 ./Export-CAPolicyWithRecs.ps1 -NoRecommendations
 
-# Offline (re‑hydrate from prior raw snapshot produced by an earlier run)
+# Offline (use a raw Graph policy snapshot; see the snapshot example below)
 #   - Skips Graph connection & enrichment queries
 #   - Still evaluates recommendations on provided raw policy array
-./Export-CAPolicyWithRecs.ps1 -RawInputFile .\CAExportRecs_Tenant_20250101_120000_raw.json -Html -Json
+./Export-CAPolicyWithRecs.ps1 -RawInputFile .\policies-raw.json -Html -Json -NoBrowser
 ```
 
 **Output files are timestamped:**
@@ -109,15 +141,15 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `PolicyID` | String (GUID) | Limit export to a single CA policy. |
-| `Html` | Switch | Emit interactive HTML (default if no other export is chosen). |
+| `Html` | Switch | Emit interactive HTML. With no export switches, HTML, JSON, and CSV are produced. |
 | `NoBrowser` | Switch | Generate HTML without automatically launching browser. |
 | `OutputPath` | String | Custom output directory path (defaults to current directory). |
-| `Json` | Switch | Emit enriched JSON (includes duplicate markers). |
+| `Json` | Switch | Emit enriched policy JSON. This is not a raw Graph snapshot. |
 | `Csv` | Switch | Emit flattened CSV of policies. |
 | `CsvPivot` | Switch | Emit pivot‑friendly wide CSV. |
 | `CsvColumns` | String[] | Custom column subset/order for `-Csv`. |
 | `NoRecommendations` | Switch | Skip recommendation analysis & omit Recommendations tab (improves runtime in large tenants). |
-| `RawInputFile` | String (path) | Use a previously exported `*_raw.json` file (offline mode). Skips Graph auth + enrichment; recommendations derived from provided data. |
+| `RawInputFile` | String (path) | Read a raw Graph policy object array (offline mode). Skips Graph authentication and enrichment; assessments use the supplied snapshot. |
 | `EmergencyAccessAccountId` | String[] (GUIDs) | Explicitly designated emergency-account object IDs for exclusion review. No account names or membership are guessed. |
 
 If no export switch is specified, HTML, JSON, and CSV are produced automatically (pivot remains opt-in).
@@ -192,53 +224,65 @@ SharePoint limited-access measurements detect the Conditional Access session set
 Microsoft guidance and prerequisite links were reviewed November 18, 2026. Licensing, preview availability, and supported-client matrices can change; consult the linked pages before deployment. This script remains read-only against the tenant.
 
 ---
-## Duplicate Detection Logic
-
-Policies are normalized (sorted properties, non‑semantic fields removed) → serialized to JSON → hashed (SHA256). Matching hashes mark `IsDuplicate` and list `DuplicateMatches`. This protects against silent drift or redundant policies.
-
----
 ## Output Artifacts
 
 | File | Contents |
 |------|----------|
-| `*.html` | Interactive report (Summary, Details, Recommendations – last omitted when `-NoRecommendations` used). |
-| `*.json` | Enriched policy objects + duplicate metadata. |
+| `*.html` | Self-contained report: Summary, Policy Details, Recommendations, and Named Locations. `-NoRecommendations` omits only Recommendations. |
+| `*.json` | Enriched policy objects; not suitable as a replacement for raw Graph policy input. |
 | `*.csv` | Flat list (one row per policy). |
 | `*-pivot.csv` | Wide format for Excel / BI pivoting. |
-| `*_raw.json` | Raw policy array snapshot (input for `-RawInputFile` offline regeneration). |
+
+HTML reports need no companion images, CSS, JavaScript downloads, or web server. The images in this README are documentation assets only.
+
+### Saving a raw snapshot
+
+The full script currently writes enriched JSON, not an additional raw snapshot. To save raw input for offline regeneration, first connect with the required Graph scopes (for example, run a connected export), then save the policy array explicitly:
+
+```powershell
+$policies = @(Get-MgIdentityConditionalAccessPolicy -All `
+  -Headers @{ Prefer = 'include-unknown-enum-members' } -ErrorAction Stop)
+ConvertTo-Json -InputObject $policies -Depth 30 |
+  Set-Content -LiteralPath .\policies-raw.json -Encoding utf8
+
+./Export-CAPolicyWithRecs.ps1 -RawInputFile .\policies-raw.json -Html -NoBrowser
+```
+
+Real exports and raw snapshots can contain sensitive identity, application, and network information. Review them before sharing; do not commit tenant reports or snapshots to a public repository. Raw policy snapshots do not include directory-name lookups or named-location definitions.
 
 ---
 ## Troubleshooting
 
 | Issue | Resolution |
 |-------|-----------|
-| Empty policy list | Confirm permissions: Policy.Read.All + Directory.Read.All. Run `Disconnect-MgGraph` then rerun. |
-| Unresolved role IDs | Role not active and no definition found: activate role or ensure sufficient RoleManagement.Read.All consent. |
-| Sanitized recommendation policy markup shows literal `&lt;` tags | You may be viewing an old report generated before sanitizer simplification; regenerate with latest script. |
-| Missing images in HTML | Ensure PNGs are in same directory as report or adjust paths. |
-| Duplicate false positives | Open JSON, verify normalized fields; adjust logic if environment-specific noise appears. |
+| Missing consent or empty policy list | Confirm Policy.Read.All, Directory.Read.All, RoleManagement.Read.All, and an appropriate Entra read role. Required scopes alone do not grant directory roles. Review the connection/API error before retrying. |
+| Unresolved user/group/role IDs | Review lookup warnings, granted permissions, and whether the referenced object still exists. Unresolved IDs are retained rather than replaced with blank or guessed names. |
+| More assessments need review than expected | Read the matching evidence and scope caveats. Exclusions, restricted conditions, incomplete metadata, and single-policy snapshots can require review without proving the policy ineffective. Optional applicability reviews are separate from Attention. |
+| Named Locations unavailable offline | Expected: raw policy arrays contain location IDs, not definitions. Use a connected HTML export for the complete location inventory. |
+| CSV warning about `NoTypeInformation` | Use the updated full exporter, which no longer passes the obsolete parameter. CSV output still contains headers and data without type-information rows. |
 | Offline mode shows fewer enriched names | `-RawInputFile` skips live resolution; rerun without offline mode for fresh enrichment. |
 
 ---
 ## Contributing
 
 PRs welcome. Please:
-1. Run PSScriptAnalyzer locally
+1. Run `Invoke-Pester -Path ./tests -Output Detailed` and `Invoke-ScriptAnalyzer -Path ./Export-CAPolicyWithRecs.ps1 -Severity Error,Warning`
 2. Keep alignment style (hash property columns) intact
 3. Add comment‑based help for any new function/parameter
 4. Update this README when adding features
+5. Use synthetic data only for documentation screenshots; never use tenant exports or sign-in/consent screenshots containing real account details
 
 ---
 ## Version History
 
 | Version | Highlights |
 |---------|-----------|
+| 3.6 | Paginated Named Locations inventory with explicit offline/failure states; post-connect scope verification; four recommendation views plus an Assessment dropdown and preference migration; improved Summary formatting; removed obsolete CSV parameter warnings. |
 | 3.5 | Fixed false restrictions from empty Graph SDK models and separated optional applicability reviews from Attention; four application-scoped templates with match/deployment measurements and resource/filter evidence; refreshed all tabs with responsive light/dark layouts, contained sticky scrolling and combined filters. |
 | 3.4 | 28 Microsoft-backed recommendation assessments with state/scope/grant-aware evaluation, prerequisites/background links, escaped evidence, emergency-account IDs, and optional advanced-scenario reviews. |
 | 3.3 | Offline mode (`-RawInputFile`), recommendations array inlined (removed external data file), improved Recommendations tab styling, simplified HTML sanitizer (prevents escaped structural tags), removed obsolete quiet behavior, minor accessibility & layout refinements. |
 | 3.2 | Overlap filter chip + row highlighting; Phish‑resistant MFA evaluation using AllowedCombinations; improved admin role GUID resolution; authentication strength caching; CA‑05 logic hardened; null overlap guard fix. |
-| 3.1| Pivot CSV dataset restored (wide format); improved role resolution (template & definition IDs), GUID parameter validation, duplicate detection hashing improvements, accessibility & JSON copy utilities. |
-
+| 3.1 | Pivot CSV dataset restored (wide format); improved role resolution (template & definition IDs), GUID parameter validation, duplicate detection hashing improvements, accessibility & JSON copy utilities. |
 | 3.0 | Recommendations refactor, duplicate detection, summary tab, accessibility & help improvements. |
 | 2.x | Styling overhaul, column selection improvements. |
 | 1.x | Initial export functionality. |
