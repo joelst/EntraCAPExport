@@ -123,6 +123,27 @@ Describe 'State-aware Microsoft recommendation assessments' {
         (Get-TestRecommendation 'CA-01').Assessment | Should -Be 'Needs review'
     }
 
+    It 'Retains scope restrictions shadowed by null SDK properties in <Representation>' -TestCases @(
+        @{ Representation = 'ordinal SDK dictionaries' }
+        @{ Representation = 'offline JSON' }
+    ) {
+        param($Representation)
+        $additional = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $additional.Add('locations', @{ includeLocations = @('office-only'); excludeLocations = @() })
+        $policy.conditions = [pscustomobject]@{
+            Users = $policy.conditions.users; Applications = $policy.conditions.applications
+            ClientAppTypes = @('all'); Locations = $null; AdditionalProperties = $additional
+        }
+        if ($Representation -eq 'offline JSON') {
+            $policy = $policy | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+        }
+
+        $result = Get-TestRecommendation 'CA-01'
+
+        $result.Assessment | Should -Be 'Needs review'
+        ($result.Evidence[0].Issues -join ' ') | Should -Match "Additional condition 'locations' limits coverage"
+    }
+
     It 'Separates optional and operational applicability reviews from actionable attention findings' {
         $results = @(Get-CaRecommendationResult -Policies @())
         @($results | Where-Object { $_.Kind -in @('Review','Template','Emergency') -and $_.NeedsAttention }).Count | Should -Be 0
@@ -166,7 +187,30 @@ Describe 'State-aware Microsoft recommendation assessments' {
     It 'Does not trust a custom strength name or unknown allowed combinations' {
         $policy.grantControls.builtInControls = @()
         $policy.grantControls.authenticationStrength = @{ id = 'custom'; displayName = 'Phishing-resistant MFA'; allowedCombinations = @('unknownFutureValue') }
+        $script:AuthStrengthCachePopulated = $true
+        $script:AuthStrengthCache = @{ custom = [pscustomobject]@{ AllowedCombinations = @('fido2') } }
         (Get-TestRecommendation 'CA-05').Assessment | Should -Be 'Needs review'
+    }
+
+    It 'Checks cached combinations for a partial assigned strength with cache available = <Cached>' -TestCases @(
+        @{ Cached = $true; ExpectedPhishingResistance = 'Enforced' }
+        @{ Cached = $false; ExpectedPhishingResistance = 'Needs review' }
+        @{ Cached = $true; Combinations = @(); ExpectedPhishingResistance = 'Needs review' }
+        @{ Cached = $true; Combinations = @('unknownFutureValue'); ExpectedPhishingResistance = 'Needs review' }
+    ) {
+        param($Cached, $ExpectedPhishingResistance, $Combinations = @('fido2', 'windowsHelloForBusiness'))
+        $policy.grantControls.builtInControls = @()
+        $policy.grantControls.authenticationStrength = @{ id = 'custom-strength'; requirementsSatisfied = 'mfa' }
+        $script:AuthStrengthCachePopulated = $true
+        $script:AuthStrengthCache = @{}
+        if ($Cached) {
+            $script:AuthStrengthCache['custom-strength'] = [pscustomobject]@{
+                Id = 'custom-strength'; AllowedCombinations = $Combinations
+            }
+        }
+
+        (Get-TestRecommendation 'CA-05').Assessment | Should -Be $ExpectedPhishingResistance
+        (Get-TestRecommendation 'CA-01').Assessment | Should -Be 'Enforced'
     }
 
     It 'Requires sign-in risk, both recommended levels, and every-time reauthentication' {
@@ -306,6 +350,33 @@ Describe 'State-aware Microsoft recommendation assessments' {
         (Get-TestRecommendation 'CA-22' -EmergencyIds @($accountId)).Evidence.Count | Should -Be 0
         $policy.conditions.users.excludeUsers = @()
         (Get-TestRecommendation 'CA-22' -EmergencyIds @($accountId)).Evidence.Count | Should -Be 1
+    }
+
+    It 'Limits emergency-account findings for <Scenario>' -TestCases @(
+        @{ Scenario = 'a directly included and excluded account'; Included = @('A'); Assignment = ''; Expected = 0 }
+        @{ Scenario = 'a directly included account without an exclusion'; Included = @('A'); Assignment = ''; Expected = 1; ExcludeA = $false }
+        @{ Scenario = 'an unrelated directly included account'; Included = @('Other'); Assignment = ''; Expected = 0 }
+        @{ Scenario = 'both directly included accounts with only one excluded'; Included = @('A', 'B'); Assignment = ''; Expected = 1 }
+        @{ Scenario = 'all users with only one designated account excluded'; Included = @('All'); Assignment = ''; Expected = 1 }
+        @{ Scenario = 'group targeting with unverified membership'; Included = @('A'); Assignment = 'includeGroups'; Expected = 1 }
+        @{ Scenario = 'role targeting with unverified membership'; Included = @('A'); Assignment = 'includeRoles'; Expected = 1 }
+    ) {
+        param($Scenario, $Included, $Assignment, $Expected, $ExcludeA = $true)
+        $accounts = @{
+            A = '10000000-0000-0000-0000-000000000001'
+            B = '10000000-0000-0000-0000-000000000002'
+            Other = '10000000-0000-0000-0000-000000000003'
+        }
+        $policy.conditions.users.includeUsers = @($Included | ForEach-Object {
+            if ($accounts.ContainsKey($_)) { $accounts[$_] } else { $_ }
+        })
+        $policy.conditions.users.excludeUsers = if ($ExcludeA) { @($accounts.A) } else { @() }
+        if ($Assignment) { $policy.conditions.users[$Assignment] = @('unexpanded-assignment') }
+
+        $result = Get-TestRecommendation 'CA-22' -EmergencyIds @($accounts.A, $accounts.B)
+
+        $result.Evidence.Count | Should -Be $Expected
+        $result.NeedsAttention | Should -Be ([bool]$Expected)
     }
 
     It 'Measures an optional M365 device template as <Expected> without a baseline pass' -TestCases @(
@@ -780,7 +851,9 @@ Describe 'Offline recommendation exports' {
         $livePolicies[1].conditions.applications.includeApplications = @('88888888-8888-8888-8888-888888888888')
         $livePolicies[1].grantControls.termsOfUse = @('99999999-9999-9999-9999-999999999999')
         $livePolicies[0].grantControls.builtInControls = @()
-        $livePolicies[0].grantControls.authenticationStrength = @{ id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }
+        $livePolicies[0].grantControls.authenticationStrength = @{
+            id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'; requirementsSatisfied = 'mfa'
+        }
         $livePolicies[2].conditions.AdditionalProperties = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         $livePolicies[2].conditions.AdditionalProperties.Add('futureCondition', @{ value = 'restricted' })
         $emergencyIds = @('10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000002')
@@ -865,6 +938,7 @@ $PSModuleAutoLoadingPreference = 'None'
         $html | Should -Match 'Global Administrator'
         $html | Should -Match 'Sample terms of use'
         $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-01'"
+        $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-05'"
         $html | Should -Match "data-assessment='needs-review'[^>]*id='rec-CA-13'"
         $html | Should -Match 'CA Export v3\.7 - Synthetic tenant'
         $html | Should -Match ([regex]::Escape("Snapshot captured: $($snapshot.CapturedAt)"))

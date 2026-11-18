@@ -861,12 +861,15 @@ function Get-AssignedAuthStrengthObject {
   $as = Get-CaProperty $Policy 'grantControls.authenticationStrength'
   if (-not $as) { return $null }
   Initialize-AuthStrengthCache
-  if ((Get-CaProperty $as 'allowedCombinations') -or (Get-CaProperty $as 'requirementsSatisfied')) { return $as }
+  if (Get-CaProperty $as 'allowedCombinations') { return $as }
   $id = [string](Get-CaProperty $as 'id')
   $name = [string](Get-CaProperty $as 'displayName')
-  if ($id -and $script:AuthStrengthCache.ContainsKey($id)) { return $script:AuthStrengthCache[$id] }
-  if ($name -and $script:AuthStrengthCache.ContainsKey($name)) { return $script:AuthStrengthCache[$name] }
-  return $null 
+  $cached = if ($id -and $script:AuthStrengthCache.ContainsKey($id)) { $script:AuthStrengthCache[$id] }
+  elseif ($name -and $script:AuthStrengthCache.ContainsKey($name)) { $script:AuthStrengthCache[$name] }
+  if ($cached -and ((Get-CaProperty $cached 'allowedCombinations') -or -not (Get-CaProperty $as 'requirementsSatisfied'))) {
+    return $cached
+  }
+  return $as
 }
 
 function Test-IsPhishResistantStrength {
@@ -1019,10 +1022,19 @@ function Get-CaProperty {
   $value = $InputObject
   foreach ($name in $Path.Split('.')) {
     if ($null -eq $value) { return }
-    $next = if ($value -is [System.Collections.IDictionary]) { $value[$name] } else { $value.PSObject.Properties[$name].Value }
-    if ($null -eq $next -and $value.AdditionalProperties) {
-      $additional = $value.AdditionalProperties
-      $next = if ($additional -is [System.Collections.IDictionary]) { $additional[$name] } else { $additional.PSObject.Properties[$name].Value }
+    $next = $null
+    foreach ($source in @($value, $value.AdditionalProperties)) {
+      if ($null -eq $source) { continue }
+      if ($source -is [System.Collections.IDictionary]) {
+        $next = $source[$name]
+        if ($null -eq $next) {
+          foreach ($key in $source.Keys) {
+            if ($key -ieq $name -and $null -ne $source[$key]) { $next = $source[$key]; break }
+          }
+        }
+      }
+      else { $next = $source.PSObject.Properties[$name].Value }
+      if ($null -ne $next) { break }
     }
     $value = $next
   }
@@ -1065,6 +1077,7 @@ function Test-CaMfaStrength {
   $id = [string](Get-CaProperty $strength 'id')
   if ($id -eq '00000000-0000-0000-0000-000000000004') { return $true }
   if (-not $PhishingResistant -and $id -in @('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003')) { return $true }
+  if (-not $PhishingResistant -and (Get-CaProperty $strength 'requirementsSatisfied') -eq 'mfa') { return $true }
   $assigned = Get-AssignedAuthStrengthObject -Policy $Policy
   if ($assigned) { $strength = $assigned }
   if (-not $PhishingResistant -and (Get-CaProperty $strength 'requirementsSatisfied') -eq 'mfa') { return $true }
@@ -1396,11 +1409,12 @@ function Get-CaRecommendationResult {
         if (-not $EmergencyAccessAccountId.Count) { continue }
         $users = Get-CaProperty $policy 'conditions.users'
         if (-not $users) { continue }
-        $potential = @($users.includeUsers | Where-Object { $_ -eq 'All' -or $_ -in $EmergencyAccessAccountId }).Count -or @(Get-CaProperty $users 'includeGroups').Count -or @(Get-CaProperty $users 'includeRoles').Count
-        if (-not $potential) { continue }
-        $missing = @($EmergencyAccessAccountId | Where-Object { $_ -notin @($users.excludeUsers) })
+        $includedUsers = @(Get-CaProperty $users 'includeUsers')
+        $broadAssignment = 'All' -in $includedUsers -or @(Get-CaProperty $users 'includeGroups').Count -or @(Get-CaProperty $users 'includeRoles').Count
+        $targetedAccounts = @($EmergencyAccessAccountId | Where-Object { $broadAssignment -or $_ -in $includedUsers })
+        $missing = @($targetedAccounts | Where-Object { $_ -notin @($users.excludeUsers) })
         if (-not $missing.Count) { continue }
-        $issues = @('Designated emergency accounts are not all directly excluded. Verify actual targeting and group-based exclusions before changing policy.')
+        $issues = @('Potentially targeted designated emergency accounts lack direct exclusions. Verify actual targeting and group-based exclusions before changing policy.')
       }
       else {
         if ($definition.Resources -and $definition.Resources -notin @('Registration','DeviceRegistration') -and
@@ -1437,7 +1451,7 @@ function Get-CaRecommendationResult {
     elseif ($definition.Kind -eq 'Hygiene' -and -not $evidence.Count) { $assessment = 'No findings'; $message = 'No matching configuration findings in this snapshot. Indirect membership and effective access are not evaluated.' }
     elseif ($definition.Kind -eq 'Emergency') {
       $message = if (-not $EmergencyAccessAccountId.Count) { 'Supply -EmergencyAccessAccountId to assess designated accounts. Account identities, readiness and exclusions are not guessed.' }
-      elseif ($evidence.Count) { 'Some potentially applicable policies do not directly exclude every designated account. Check the evidence, membership, and deployment state; do not blindly add exclusions.' }
+      elseif ($evidence.Count) { 'Some potentially targeted designated accounts lack direct exclusions. Check the evidence, membership, and deployment state; do not blindly add exclusions.' }
       else { 'No direct-exclusion gaps were found for the designated accounts on potentially applicable policies. Independently validate account count, readiness, monitoring, indirect targeting and recovery tests.' }
     }
     elseif ($definition.Kind -eq 'Template') {
