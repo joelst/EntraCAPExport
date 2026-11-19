@@ -3,15 +3,31 @@ const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { join, resolve } = require('node:path');
+const { join, resolve, win32 } = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { test } = require('node:test');
 
-const browser = process.env.CA_BROWSER_PATH || (
-  process.platform === 'darwin' ? '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' :
-  process.platform === 'win32' ? join(process.env.PROGRAMFILES, 'Microsoft/Edge/Application/msedge.exe') :
-  '/usr/bin/chromium'
-);
+function findBrowser(platform, env, exists) {
+  if (env.CA_BROWSER_PATH) return env.CA_BROWSER_PATH;
+  if (platform === 'darwin') return '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge';
+  if (platform !== 'win32') return '/usr/bin/chromium';
+  const candidates = [env['ProgramFiles(x86)'], env.PROGRAMFILES]
+    .filter(Boolean)
+    .map(directory => win32.join(directory, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+  return candidates.find(exists) || candidates[0];
+}
+
+test('Windows browser discovery prefers installed Edge and respects override', () => {
+  const env = { 'ProgramFiles(x86)': 'C:\\Program Files (x86)', PROGRAMFILES: 'C:\\Program Files' };
+  const x86 = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+  const native = 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe';
+  assert.equal(findBrowser('win32', env, () => true), x86);
+  assert.equal(findBrowser('win32', env, path => path === native), native);
+  assert.equal(findBrowser('win32', { ...env, CA_BROWSER_PATH: 'D:\\Browser\\edge.exe' }, () => true), 'D:\\Browser\\edge.exe');
+  assert.equal(findBrowser('win32', {}, () => false), undefined);
+});
+
+const browser = findBrowser(process.platform, process.env, existsSync);
 assert.ok(existsSync(browser), 'Set CA_BROWSER_PATH to a Chromium/Edge/Chrome executable to run report interaction tests.');
 
 const group1 = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
@@ -44,6 +60,14 @@ async function checkInteractions(groupId) {
   check(window.reportErrors.length === 0, window.reportErrors.join('; '));
   check(document.title.includes('v4.0'), '4.0 version stamp');
   check(rows().length === 5 && visible().length === 5, 'initial policy count');
+  check(!get('#show-suggested-names').checked && all('.suggested-name').every(name => name.hidden), 'restored suggestions are reset and hidden');
+  check(get('#match-only').disabled && !get('#match-only').checked && get('#clear-comparison').disabled, 'restored comparison controls are reset');
+  get('#show-suggested-names').checked = true;
+  get('#match-only').checked = true;
+  get('#match-only').disabled = false;
+  get('#clear-comparison').disabled = false;
+  window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }));
+  check(!get('#show-suggested-names').checked && get('#match-only').disabled && !get('#match-only').checked && get('#clear-comparison').disabled, 'pageshow resets restored controls');
   change(get('#policy-search'), 'block');
   check(visible().length === 2, 'block search matches real block text/control, not every NON-BLOCKING label');
   change(get('#policy-search'), 'non-blocking');
@@ -62,6 +86,8 @@ async function checkInteractions(groupId) {
   check(all('tr.selected').length === 0, 'entity click must not toggle row selection');
   change(get('#match-only'), true);
   check(visible().length === 3, 'entity matching filter');
+  window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+  check(get('#match-only').checked && !get('#match-only').disabled && visible().length === 3, 'back-forward cache preserves active comparison');
   change(get('#status-filter'), 'report');
   check(visible().length === 1, 'comparison and deployment filters combine');
   change(get('#policy-search'), 'no such policy');
@@ -126,6 +152,8 @@ async function checkInteractions(groupId) {
   check(enriched['Require MFA'] === 'True', 'enriched JSON view includes configured controls');
   for (const row of rows().slice(1)) row.querySelector('.lazy-json summary').click();
   await new Promise(resolve => setTimeout(resolve, 0));
+  const sdkOriginal = JSON.parse(rows()[1].querySelector('[data-mode="orig"].json-block').textContent);
+  check(sdkOriginal.Id === '20000000-0000-0000-0000-000000000000', 'Graph SDK PascalCase Id loads original JSON');
   change(get('#policy-search'), 'block');
   check(visible().length === 2, 'opening JSON must not make non-blocking policies match block');
   change(get('#policy-search'), 'requiremfa');
@@ -147,7 +175,7 @@ async function checkSinglePolicy() {
   await new Promise(resolve => setTimeout(resolve, 0));
   const original = JSON.parse(details.querySelector('[data-mode="orig"].json-block').textContent);
   const enriched = JSON.parse(details.querySelector('[data-mode="mut"].json-block').textContent);
-  if (original.id !== enriched.PolicyId) throw new Error('Single-policy original and enriched JSON must both load');
+  if (original.Id !== enriched.PolicyId) throw new Error('Single-policy SDK-cased original and enriched JSON must both load');
   if (original.description !== enriched.Description) throw new Error('Single-policy JSON must preserve the description');
   return 5;
 }
@@ -199,6 +227,8 @@ for (const { noRecommendations, single, guests } of [
         ]
       };
       const payload = '</script><script>window.reportInjected=true</script>';
+      snapshot.Policies[1].Id = snapshot.Policies[1].id;
+      delete snapshot.Policies[1].id;
       snapshot.Policies[0].displayName += ' ' + payload;
       snapshot.Policies[0].description = payload + '\u2028\u2029';
       snapshot.Policies[0].sessionControls = {
@@ -212,7 +242,8 @@ for (const { noRecommendations, single, guests } of [
       if (single) {
         snapshot.Policies = snapshot.Policies.slice(0, 1);
         snapshot.PartialExport = true;
-        snapshot.Policies[0].id = "id'><img src=x onerror='window.reportInjected=true'>";
+        snapshot.Policies[0].Id = "id'><img src=x onerror='window.reportInjected=true'>";
+        delete snapshot.Policies[0].id;
         snapshot.Policies[0].state = "future'><img src=x onerror='window.reportInjected=true'>";
       }
       if (guests) {
@@ -244,7 +275,17 @@ for (const { noRecommendations, single, guests } of [
       assert.equal(exportResult.status, 0, exportResult.stdout + exportResult.stderr);
       const report = join(output, readdirSync(output).find(file => file.endsWith('.html')));
       let html = readFileSync(report, 'utf8');
-      html = html.replace('<head>', '<head><script>window.reportErrors=[];window.addEventListener("error",event=>window.reportErrors.push(event.message));</script>');
+      html = html.replace('<head>', `<head><script>
+        window.reportErrors=[];
+        window.addEventListener("error",event=>window.reportErrors.push(event.message));
+        document.addEventListener("DOMContentLoaded", function(){
+          document.getElementById('show-suggested-names').checked = true;
+          const match = document.getElementById('match-only');
+          match.checked = true;
+          match.disabled = false;
+          document.getElementById('clear-comparison').disabled = false;
+        });
+      </script>`);
       const validate = guests ? checkGuestSelectors : single ? checkSinglePolicy : checkInteractions;
       html += `<script>window.addEventListener('load',async function(){
         const result = document.createElement('pre'); result.id='ui-test-result';

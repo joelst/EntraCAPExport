@@ -3016,7 +3016,7 @@ window.CAExportData = $policyDataJson;
 window.RawPolicyDataIndex = (function(){
   var arr = $rawIndexJson;
   var idx = Object.create(null);
-  for(var i=0;i<arr.length;i++){ var it=arr[i]; if(it && it.id){ idx[it.id]=it; } }
+  for(var i=0;i<arr.length;i++){ var it=arr[i]; var id=it && (it.id || it.Id); if(id){ idx[id]=it; } }
   return idx;
 })();
 // Accessible report navigation and interactions
@@ -3039,6 +3039,18 @@ document.addEventListener('DOMContentLoaded', function(){
   var clearComparison = document.getElementById('clear-comparison');
   var comparisonStatus = document.getElementById('comparison-status');
   var suggestedNames = document.getElementById('show-suggested-names');
+  function resetComparisonControls(){
+    suggestedNames.checked = false;
+    policies.querySelectorAll('.suggested-name').forEach(function(name){ name.hidden = true; });
+    matchOnly.checked = false;
+    matchOnly.disabled = true;
+    clearComparison.disabled = true;
+  }
+  resetComparisonControls();
+  // Firefox may restore form state after DOMContentLoaded; retain live state on bfcache restores.
+  window.addEventListener('pageshow', function(event){
+    if(!event.persisted && !comparison){ resetComparisonControls(); filterPolicies(); }
+  });
   suggestedNames.addEventListener('change', function(){
     policies.querySelectorAll('.suggested-name').forEach(function(name){ name.hidden = !suggestedNames.checked; });
     filterPolicies();
