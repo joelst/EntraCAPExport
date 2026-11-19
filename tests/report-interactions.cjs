@@ -124,6 +124,15 @@ async function checkInteractions(groupId) {
   check(original.displayName.includes('<' + '/script>'), 'script-safe JSON restores original tenant strings');
   check(original.description.endsWith('\u2028\u2029'), 'JSON view preserves unicode separators');
   check(enriched['Require MFA'] === 'True', 'enriched JSON view includes configured controls');
+  for (const row of rows().slice(1)) row.querySelector('.lazy-json summary').click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  change(get('#policy-search'), 'block');
+  check(visible().length === 2, 'opening JSON must not make non-blocking policies match block');
+  change(get('#policy-search'), 'requiremfa');
+  check(visible().length === 0, 'opening JSON must not make hidden suggested names searchable');
+  change(get('#show-suggested-names'), true);
+  check(visible().length === 4, 'visible suggested names remain searchable after opening JSON');
+  get('#policy-search-clear').click();
   check(!window.reportInjected, 'opening JSON must not execute its content');
   check(window.reportErrors.length === 0, window.reportErrors.join('; '));
   return checks;
@@ -143,12 +152,32 @@ async function checkSinglePolicy() {
   return 5;
 }
 
-for (const { noRecommendations, single } of [
+async function checkGuestSelectors() {
+  const rows = [...document.querySelectorAll('#panel-policies tbody tr')];
+  const token = rows[0].querySelector('[data-entity-type="guest-selector"]');
+  token.click();
+  assertCount('.match-include', 2, 'Equivalent guest entities must match');
+  assertCount('.match-exclude', 1, 'Equivalent excluded guest entities must match');
+  document.getElementById('match-only').click();
+  if (rows.filter(row => row.style.display !== 'none').length !== 2) throw new Error('Entity filter must exclude different tenant restrictions');
+  rows[0].querySelector('[data-compare-field="Included Users"] .compare-cell').click();
+  assertCount('.cell-match', 2, 'Equivalent whole guest assignment cells must match');
+  if (rows[2].style.display !== 'none') throw new Error('Whole-cell comparison must preserve different tenant restrictions');
+  if (window.reportErrors.length) throw new Error(window.reportErrors.join('; '));
+  return 6;
+
+  function assertCount(selector, expected, message) {
+    if (document.querySelectorAll(selector).length !== expected) throw new Error(message);
+  }
+}
+
+for (const { noRecommendations, single, guests } of [
   { noRecommendations: false, single: false },
   { noRecommendations: true, single: false },
-  { noRecommendations: true, single: true }
+  { noRecommendations: true, single: true },
+  { noRecommendations: true, single: false, guests: true }
 ]) {
-  test(`Report interactions (NoRecommendations=${noRecommendations}, Single=${single})`, () => {
+  test(`Report interactions (NoRecommendations=${noRecommendations}, Single=${single}, Guests=${!!guests})`, () => {
     const directory = mkdtempSync(join(tmpdir(), 'ca-report-ui-'));
     try {
       const snapshot = {
@@ -186,6 +215,23 @@ for (const { noRecommendations, single } of [
         snapshot.Policies[0].id = "id'><img src=x onerror='window.reportInjected=true'>";
         snapshot.Policies[0].state = "future'><img src=x onerror='window.reportInjected=true'>";
       }
+      if (guests) {
+        const first = {
+          guestOrExternalUserTypes: 'internalGuest, b2bCollaborationGuest',
+          externalTenants: { membershipKind: 'enumerated', members: [group1, group2] }
+        };
+        const equivalent = {
+          externalTenants: { members: [group2.toUpperCase(), group1, group1], membershipKind: 'enumerated' },
+          guestOrExternalUserTypes: 'B2BCollaborationGuest, internalGuest'
+        };
+        snapshot.Policies = [
+          policy(1, 'Guest pilot A', 'enabled', { includeGuestsOrExternalUsers: first }),
+          policy(2, 'Guest pilot B', 'enabled', { includeGuestsOrExternalUsers: equivalent, excludeGuestsOrExternalUsers: first }),
+          policy(3, 'Different tenant restriction', 'enabled', {
+            includeGuestsOrExternalUsers: { ...first, externalTenants: { membershipKind: 'enumerated', members: [group3] } }
+          })
+        ];
+      }
       const input = join(directory, 'snapshot.json');
       writeFileSync(input, JSON.stringify(snapshot));
       const output = join(directory, 'output');
@@ -199,7 +245,7 @@ for (const { noRecommendations, single } of [
       const report = join(output, readdirSync(output).find(file => file.endsWith('.html')));
       let html = readFileSync(report, 'utf8');
       html = html.replace('<head>', '<head><script>window.reportErrors=[];window.addEventListener("error",event=>window.reportErrors.push(event.message));</script>');
-      const validate = single ? checkSinglePolicy : checkInteractions;
+      const validate = guests ? checkGuestSelectors : single ? checkSinglePolicy : checkInteractions;
       html += `<script>window.addEventListener('load',async function(){
         const result = document.createElement('pre'); result.id='ui-test-result';
         try { result.textContent = 'PASS ' + await (${validate.toString()})('${group1}') + ' checks'; }
@@ -210,7 +256,7 @@ for (const { noRecommendations, single } of [
       const browserResult = spawnSync(browser, [
         '--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
         '--disable-background-networking', `--user-data-dir=${join(directory, 'browser-profile')}`,
-        '--dump-dom', '--timeout=15000', pathToFileURL(report).href
+        '--dump-dom', '--timeout=15000', '--virtual-time-budget=3000', pathToFileURL(report).href
       ], { encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024 });
       assert.equal(browserResult.status, 0, browserResult.stderr);
       const result = browserResult.stdout.match(/<pre id="ui-test-result">([\s\S]*?)<\/pre>/);

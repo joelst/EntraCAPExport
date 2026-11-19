@@ -894,6 +894,56 @@ Describe 'Naming hints and assignment identity' {
         $first.Label | Should -Be $second.Label
         $first.Id | Should -Not -Be $second.Id
     }
+
+    It 'Matches equivalent guest selectors regardless of property, guest-type, or tenant-member ordering' {
+        $policy.conditions.users.includeGuestsOrExternalUsers = [ordered]@{
+            guestOrExternalUserTypes = 'b2bCollaborationGuest, internalGuest'
+            externalTenants = [ordered]@{ membershipKind = 'enumerated'; members = @('TENANT-2', 'tenant-1', 'tenant-1') }
+            futureRestriction = [ordered]@{ enabled = $false; modes = @('one') }
+        }
+        $first = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $policy.conditions.users.includeGuestsOrExternalUsers = [pscustomobject]@{
+            FutureRestriction = [pscustomobject]@{ Modes = @('one'); Enabled = $false }
+            ExternalTenants = [pscustomobject]@{
+                Members = @()
+                MembershipKind = 'enumerated'
+                AdditionalProperties = @{ members = @('tenant-1', 'tenant-2') }
+            }
+            GuestOrExternalUserTypes = ' internalGuest, B2BCollaborationGuest, internalGuest '
+        }
+        $second = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $first.Id | Should -BeExactly $second.Id
+        $canonical = $second.Id | ConvertFrom-Json -AsHashtable
+        $canonical.futurerestriction.enabled | Should -BeFalse
+        ($canonical.futurerestriction.modes -is [array]) | Should -BeTrue
+        $canonical.futurerestriction.modes.Count | Should -Be 1
+    }
+
+    It 'Preserves <Field> restrictions when comparing guest selectors' -TestCases @(
+        @{ Field = 'membership kind' }
+        @{ Field = 'guest types' }
+        @{ Field = 'additional flag' }
+        @{ Field = 'additional array order' }
+        @{ Field = 'empty versus singleton array' }
+    ) {
+        param($Field)
+        $selector = @{
+            guestOrExternalUserTypes = 'internalGuest'
+            externalTenants = @{ membershipKind = 'enumerated'; members = @('tenant-1') }
+            futureRestriction = @{ enabled = $false; modes = @('one', 'two'); extra = @() }
+        }
+        $policy.conditions.users.includeGuestsOrExternalUsers = $selector
+        $first = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        switch ($Field) {
+            'membership kind' { $selector.externalTenants.membershipKind = 'all' }
+            'guest types' { $selector.guestOrExternalUserTypes = 'b2bCollaborationGuest' }
+            'additional flag' { $selector.futureRestriction.enabled = $true }
+            'additional array order' { $selector.futureRestriction.modes = @('two', 'one') }
+            'empty versus singleton array' { $selector.futureRestriction.extra = @('one') }
+        }
+        $second = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $first.Id | Should -Not -Be $second.Id
+    }
 }
 
 Describe 'Graph connection scope verification' {
@@ -1243,6 +1293,15 @@ Describe 'Offline recommendation exports' {
     It 'Rejects tenant selection with offline input' {
         { & $exportScript -RawInputFile $rawPath -TenantID 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' } |
             Should -Throw '*TenantID cannot be combined with RawInputFile*'
+    }
+
+    It 'Preserves positional policy selection with offline input' {
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'positional-policy')
+        & $exportScript $device.id -RawInputFile $rawPath -OutputPath $out.FullName -Json -NoBrowser
+        $json = Get-ChildItem $out.FullName -Filter '*.json'
+        $selected = @(Get-Content -LiteralPath $json.FullName -Raw | ConvertFrom-Json)
+        $selected.Count | Should -Be 1
+        $selected[0].PolicyId | Should -Be $device.id
     }
 
     It 'Stops a connected run before Graph calls when a core module import fails' {

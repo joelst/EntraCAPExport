@@ -111,9 +111,6 @@ https://creativecommons.org/licenses/by-nc-sa/4.0/
 param (
   [Parameter()]
   [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
-  [string]$TenantID,
-  [Parameter()]
-  [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
   [String]$PolicyID,
   [Parameter(HelpMessage = 'Path to a portable *_raw.json snapshot or legacy raw policy array (skips Graph calls).')]
   [ValidateScript({ Test-Path $_ -PathType Leaf })]
@@ -127,7 +124,10 @@ param (
   [switch]$NoRecommendations,
   [string[]]$CsvColumns,
   [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
-  [string[]]$EmergencyAccessAccountId
+  [string[]]$EmergencyAccessAccountId,
+  [Parameter()]
+  [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+  [string]$TenantID
 )
 
 function Write-Info {
@@ -1181,6 +1181,44 @@ function Get-CaNamingHint {
   }
 }
 
+function ConvertTo-CaGuestSelectorValue {
+  <#
+  .SYNOPSIS
+    Canonicalize guest-selector properties and known sets without dropping additional restrictions.
+  #>
+  param($Value, [string]$Path = '')
+  if ($null -eq $Value) { return $null }
+  if ($Path -in @('guestorexternalusertypes', 'externaltenants.members')) {
+    $tokens = @((New-TokenSet $Value) | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object)
+    if ($Path -eq 'guestorexternalusertypes') { return $tokens -join ',' }
+    return ,$tokens
+  }
+  if ($Path -eq 'externaltenants.membershipkind') { return ([string]$Value).Trim().ToLowerInvariant() }
+  if ($Value -is [string] -or $Value -is [ValueType]) { return $Value }
+  if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) {
+    return ,@(foreach ($item in $Value) { ConvertTo-CaGuestSelectorValue -Value $item -Path "$Path[]" })
+  }
+  $properties = @{}
+  foreach ($source in @($Value.AdditionalProperties, $Value)) {
+    if ($null -eq $source) { continue }
+    $names = if ($source -is [System.Collections.IDictionary]) { @($source.Keys) } else { @($source.PSObject.Properties.Name) }
+    foreach ($name in $names) {
+      if ($name -eq 'AdditionalProperties') { continue }
+      if ($source -is [System.Collections.IDictionary]) { $candidate = $source[$name] }
+      else { $candidate = $source.PSObject.Properties[$name].Value }
+      if (-not $properties.ContainsKey($name) -or (Test-CaConfiguredValue $candidate)) {
+        $properties[$name.ToLowerInvariant()] = $candidate
+      }
+    }
+  }
+  $canonical = [ordered]@{}
+  foreach ($name in ($properties.Keys | Sort-Object)) {
+    $childPath = if ($Path) { "$Path.$name" } else { $name }
+    $canonical[$name] = ConvertTo-CaGuestSelectorValue -Value $properties[$name] -Path $childPath
+  }
+  return $canonical
+}
+
 function Get-CaAssignmentToken {
   <#
   .SYNOPSIS
@@ -1211,7 +1249,7 @@ function Get-CaAssignmentToken {
     $guests = Get-CaProperty $Policy "conditions.users.${direction}GuestsOrExternalUsers"
     if (Test-CaConfiguredValue $guests) {
       [pscustomobject]@{
-        Type = 'guest-selector'; Id = (ConvertTo-Json -InputObject $guests -Depth 20 -Compress)
+        Type = 'guest-selector'; Id = (ConvertTo-Json -InputObject (ConvertTo-CaGuestSelectorValue $guests) -Depth 100 -Compress -WarningAction Stop)
         Label = "Guest selector: $(Get-CaProperty $guests 'guestOrExternalUserTypes')"; Direction = $direction
       }
     }
@@ -3366,7 +3404,7 @@ document.addEventListener('DOMContentLoaded', function(){
         var match = false;
         for(var c=0;c<cells.length;c++){
           var searchable = cells[c].cloneNode(true);
-          searchable.querySelectorAll('.compare-cell, .suggested-name[hidden]').forEach(function(control){ control.remove(); });
+          searchable.querySelectorAll('.compare-cell, .suggested-name[hidden], .lazy-json').forEach(function(control){ control.remove(); });
           if(/^block(?:s|ed|ing)?$/.test(q)){
             searchable.querySelectorAll('.pill-grant').forEach(function(control){ control.remove(); });
           }
