@@ -58,7 +58,7 @@ Neither script changes tenant policies. Existing portable snapshots and legacy r
 
 ## Screenshots — sample data only
 
-These pre-release development captures use **Contoso Demo (sample data)**. They may display development version labels and do not show the final 4.0 naming hints, NON-BLOCKING labels or comparison controls. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
+These captures were generated with the **4.0 exporter** from a synthetic **Contoso Demo (sample data)** snapshot containing 14 policies and four named locations. All tenant-specific information was generated from scratch, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
 
 The sample policies illustrate report behavior, **not a recommended production baseline**. Both light and dark themes are shown.
 
@@ -70,9 +70,27 @@ The sample policies illustrate report behavior, **not a recommended production b
 </details>
 
 <details>
-<summary><strong>Policy Details</strong> — sample assignments, deployment tags, and contained table scrolling</summary>
+<summary><strong>Policy Details</strong> — assignment tokens, naming hints, and comparison controls</summary>
 
-![Sample Policy Details tab with resolved example identities and deployment-state tags](./images/report-policies.png)
+![Version 4.0 Policy Details with resolved sample assignment tokens, deployment-state tags, naming hints, and comparison controls](./images/report-policies.png)
+
+</details>
+
+<details>
+<summary><strong>Assignment patterns</strong> — matching group includes/excludes across policies</summary>
+
+Clicking **Sample - Employees** and selecting **Show matching policies only** highlights three included matches with solid borders and one excluded match with a dashed border. These are direct-assignment matches, not group-membership expansion or effective-access results.
+
+![Sample group comparison showing four matching policies, three included matches, and one excluded match](./images/report-assignment-patterns.png)
+
+</details>
+
+<details>
+<summary><strong>Naming hints</strong> — misleading Block/MFA names and optional suggestions</summary>
+
+The fictional review examples show a name claiming **Block** without a Block grant and a name claiming **Require MFA** with an OR alternative. **NON-BLOCKING** means no Block grant is configured; it does not mean access is granted. Suggested names are heuristics, not automatic renames.
+
+![Expanded naming hints and suggested names beside NON-BLOCKING grants for two fictional name/configuration mismatches](./images/report-naming-hints.png)
 
 </details>
 
