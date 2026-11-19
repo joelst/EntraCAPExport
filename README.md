@@ -15,6 +15,7 @@ The legacy script is not a wrapper: its existing behavior is frozen, and it does
 
 | Migration concern | Supported exporter behavior |
 |-------------------|-----------------------------|
+| Tenant and policy arguments | Use named arguments: the legacy script's first positional argument is `TenantID`, but the supported script's first positional argument is `PolicyID`. Its `-TenantID` accepts a tenant **GUID**, not a tenant domain such as `contoso.onmicrosoft.com`; find the tenant ID in the Microsoft Entra admin center's tenant overview. |
 | PowerShell runtime | Requires PowerShell 7.5+ (`pwsh`), including offline replay. Windows PowerShell 5.1 (`powershell.exe`) is not supported and stops at the native version prerequisite check. |
 | Output formats | No format switches produces HTML, enriched JSON and CSV. Specifying formats selects only those reports; use `-Html -Csv` or `-Html -CsvPivot` if callers previously relied on HTML always being added. |
 | Raw collection | Every connected run also writes a portable `*_raw.json`, independently of report-format selection. Offline replay does not write another snapshot. |
@@ -23,6 +24,8 @@ The legacy script is not a wrapper: its existing behavior is frozen, and it does
 | CSV schema | The flat CSV adds `Naming Hints`; use `-CsvColumns` when consumers require a fixed subset/order. Pivot CSV also includes a Naming Hints row. |
 | Graph consent | Requires `Policy.Read.All`, `Directory.Read.All` and `RoleManagement.Read.All`; do not assume the legacy permission set is sufficient. |
 | Analysis | `-NoRecommendations` skips the 32 assessments, not naming hints, enrichment or connected-run snapshot collection. |
+
+For example, replace `.\Export-CaPolicy.ps1 <tenant-guid>` with `.\Export-CAPolicyWithRecs.ps1 -TenantID <tenant-guid>`. Specify `-PolicyID <policy-guid>` separately when exporting one policy.
 
 Neither script changes tenant policies. Existing portable snapshots and legacy raw policy arrays remain valid offline inputs; enriched report JSON is not an offline snapshot.
 

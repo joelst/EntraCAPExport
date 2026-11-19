@@ -135,6 +135,35 @@ async function checkInteractions(groupId) {
   get('#policy-search-clear').click();
   const hints = rows()[0].querySelector('.naming-guidance');
   check(hints.textContent.includes('no Block grant'), 'blocking name mismatch is explained');
+  const originalTheme = document.documentElement.dataset.theme;
+  const rgb = color => {
+    const values = color.match(/[\d.]+/g).map(Number);
+    return [values[0], values[1], values[2], values.length > 3 ? values[3] : 1];
+  };
+  const background = element => {
+    const layers = [];
+    for (let node = element; node; node = node.parentElement) layers.unshift(rgb(getComputedStyle(node).backgroundColor));
+    return layers.reduce((base, [r, g, b, alpha]) => [r, g, b].map((channel, i) => channel * alpha + base[i] * (1 - alpha)), [255, 255, 255]);
+  };
+  const luminance = color => color.slice(0, 3).map(channel => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  }).reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0);
+  for (const theme of ['light', 'dark']) {
+    document.documentElement.dataset.theme = theme;
+    for (const row of rows().slice(0, 2)) {
+      const summary = row.querySelector('.naming-guidance summary');
+      for (const selected of [false, true]) {
+        row.classList.toggle('selected', selected);
+        const foreground = luminance(rgb(getComputedStyle(summary).color));
+        const backdrop = luminance(background(summary));
+        const contrast = (Math.max(foreground, backdrop) + 0.05) / (Math.min(foreground, backdrop) + 0.05);
+        check(contrast >= 4.5, `${theme} naming hint contrast on ${selected ? 'selected' : 'unselected'} row: ${contrast.toFixed(2)}:1`);
+      }
+      row.classList.remove('selected');
+    }
+  }
+  document.documentElement.dataset.theme = originalTheme;
   hints.querySelector('summary').click();
   check(hints.open && all('tr.selected').length === 0, 'naming disclosure does not select row');
   check(!all('.pill-grant').some(pill => pill.textContent === 'ALLOW'), 'no misleading ALLOW label');

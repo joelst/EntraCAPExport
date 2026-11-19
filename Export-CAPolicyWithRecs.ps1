@@ -2519,7 +2519,7 @@ if ($HTMLExport) {
   .pill-grant { color:var(--cp-text); border-color:var(--cp-border-strong); }
   .pill-recommended { color:var(--cp-accent); margin-left:0.375rem; }
   .naming-guidance { margin-top:0.5rem; font-size:0.75rem; font-weight:400; }
-  .naming-guidance summary { color:var(--cp-warning); cursor:pointer; }
+  .naming-guidance summary { color:var(--cp-text); cursor:pointer; }
   .naming-guidance ul { margin:0.5rem 0; padding-left:1rem; }
   .suggested-name { margin-top:0.5rem; color:var(--cp-text-muted); font-weight:400; font-size:0.75rem; }
   .comparison-bar { padding:0.75rem; margin-bottom:1rem; border:1px solid var(--cp-border); border-radius:0.625rem; background:var(--cp-surface); }
