@@ -3,6 +3,16 @@
 
 <# Each Describe defines needed helper functions in its own BeforeAll to work with Pester V5 discovery (which does not execute top-level code). #>
 
+Describe 'Supported PowerShell runtime' {
+    It 'Declares a native version requirement before script execution' {
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1", [ref]$null, [ref]$errors)
+        @($errors).Count | Should -Be 0
+        $ast.ScriptRequirements.RequiredPSVersion | Should -Be ([version]'7.5')
+    }
+}
+
 Describe 'State-aware Microsoft recommendation assessments' {
     BeforeAll {
         $source = Get-Content -LiteralPath "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1" -Raw
@@ -1235,6 +1245,54 @@ Describe 'Offline recommendation exports' {
             Should -Throw '*TenantID cannot be combined with RawInputFile*'
     }
 
+    It 'Stops a connected run before Graph calls when a core module import fails' {
+        Mock Get-Module { [pscustomobject]@{ Name = $Name } }
+        Mock Import-Module { throw 'Invalid document element' } -ParameterFilter { $Name -like 'Microsoft.Graph.*' }
+        Mock Get-MgContext { throw 'Must not connect' }
+        Mock Get-MgIdentityConditionalAccessPolicy { throw 'Must not collect' }
+        { & $exportScript -OutputPath $TestDrive -Csv } | Should -Throw '*Required Graph collection cannot continue*'
+        Should -Invoke Get-MgContext -Times 0
+        Should -Invoke Get-MgIdentityConditionalAccessPolicy -Times 0
+    }
+
+    It 'Exports policies and snapshots with unresolved IDs when optional module imports fail' {
+        $livePolicy = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $userId = '66666666-6666-6666-6666-666666666666'
+        $groupId = '77777777-7777-7777-7777-777777777777'
+        $livePolicy.conditions.users.includeUsers = @($userId)
+        $livePolicy.conditions.users.includeGroups = @($groupId)
+        Mock Get-Module { [pscustomobject]@{ Name = $Name } }
+        Mock Import-Module {} -ParameterFilter { $Name -like 'Microsoft.Graph.*' }
+        Mock Import-Module { throw 'Invalid document element from proxy' } -ParameterFilter {
+            $Name -in @('Microsoft.Graph.Users', 'Microsoft.Graph.Identity.DirectoryManagement')
+        }
+        Mock Get-MgContext {
+            [pscustomobject]@{ Account = 'test@example.invalid'; Scopes = @('Policy.Read.All', 'Directory.Read.All', 'RoleManagement.Read.All') }
+        }
+        Mock Get-MgOrganization { throw 'Unavailable optional command must not run' }
+        Mock Get-MgUser { throw 'Unavailable optional command must not run' }
+        Mock Get-MgGroup { [pscustomobject]@{ DisplayName = 'Resolved group' } }
+        Mock Get-MgIdentityConditionalAccessPolicy { @($livePolicy) }
+        Mock Get-MgIdentityConditionalAccessNamedLocation { @() }
+        Mock Get-MgPolicyAuthenticationStrengthPolicy { @() }
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'optional-module-failures')
+
+        & $exportScript -OutputPath $out.FullName -Csv -NoRecommendations -WarningVariable moduleWarnings
+
+        Should -Invoke Get-MgUser -Times 0
+        Should -Invoke Get-MgOrganization -Times 0
+        Should -Invoke Get-MgGroup -Times 1 -Exactly
+        @($moduleWarnings).Count | Should -Be 2
+        $csv = Get-ChildItem $out.FullName -Filter '*.csv'
+        $row = Import-Csv $csv.FullName
+        $row.'Included Users' | Should -Match $userId
+        $row.'Included Users' | Should -Match 'Resolved group'
+        $snapshot = Get-Content (Get-ChildItem $out.FullName -Filter '*_raw.json').FullName -Raw | ConvertFrom-Json
+        $snapshot.TenantName | Should -Be 'UnknownTenant'
+        @($snapshot.Lookups.Users.PSObject.Properties).Count | Should -Be 0
+        $snapshot.Lookups.Groups.$groupId | Should -Be 'Resolved group'
+    }
+
     It 'Keeps embedded policy JSON script-safe and array-shaped for a single policy' {
         $named = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
         $payload = '</script><script>window.reportInjected=true</script>'
@@ -1608,6 +1666,7 @@ Describe 'User and group enrichment' {
 
     BeforeEach {
         $script:OfflineMode = $false
+        $DirectoryModuleAvailable = $true
         $HTMLExport = $false
         $userIds = @('11111111-1111-1111-1111-111111111111')
         $groupIds = @('22222222-2222-2222-2222-222222222222')
@@ -1618,18 +1677,65 @@ Describe 'User and group enrichment' {
         Mock Get-MgRoleManagementDirectoryRoleDefinition { @() }
         Mock Get-MgIdentityConditionalAccessNamedLocation { @() }
         Mock Write-Warn {}
-    }
-
-    It 'Loads the user and group commands during default module initialization' {
-        Mock Get-PackageProvider { [pscustomobject]@{ Name = 'NuGet' } }
-        Mock Get-PSRepository { [pscustomobject]@{ InstallationPolicy = 'Trusted' } }
         Mock Get-Module { [pscustomobject]@{ Name = $Name } }
         Mock Import-Module {}
+    }
 
-        Initialize-GraphModule
+    It 'Loads only core modules during default initialization without contacting the gallery' {
+        Mock Get-PSRepository { throw 'Gallery must not be accessed' }
+        Mock Install-Module { throw 'Installation must not be attempted' }
+        Initialize-GraphModule | Should -BeTrue
+        Should -Invoke Import-Module -Times 2 -Exactly
+        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Authentication' -and $Global }
+        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Identity.SignIns' -and $Global }
+        Should -Invoke Get-PSRepository -Times 0
+        Should -Invoke Install-Module -Times 0
+    }
 
-        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
+    It 'Stops on a required module <Failure> failure with the underlying error' -TestCases @(
+        @{ Failure = 'install' }
+        @{ Failure = 'import' }
+    ) {
+        param($Failure)
+        if ($Failure -eq 'install') {
+            Mock Get-Module { @() }
+            Mock Install-Module { throw 'Invalid document element from proxy' }
+        }
+        else { Mock Import-Module { throw 'Assembly could not be loaded' } }
+        { Initialize-GraphModule } | Should -Throw '*Graph module*Required Graph collection cannot continue*'
+        Should -Invoke Write-Warn -Times 0
+    }
+
+    It 'Skips a failed optional module once without calling its per-entity lookups' {
+        $userIds += '33333333-3333-3333-3333-333333333333'
+        Mock Import-Module { throw 'Invalid document element from proxy' } -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
+        . $enrich
+        Should -Invoke Get-MgUser -Times 0
+        Should -Invoke Get-MgGroup -Times 1 -Exactly
+        Should -Invoke Write-Warn -Times 1 -Exactly -ParameterFilter {
+            $Message -like "*Microsoft.Graph.Users*Invalid document element from proxy*Optional enrichment*"
+        }
+        $UserMap.Count | Should -Be 0
+        Convert-IdListToName -List $userIds -Map $UserMap | Should -Be $userIds
+    }
+
+    It 'Does not install lookup modules for unreferenced entity types' {
+        $userIds = $groupIds = @()
+        . $enrich
+        Should -Invoke Import-Module -Times 0
+        Should -Invoke Get-MgUser -Times 0
+        Should -Invoke Get-MgGroup -Times 0
+        Should -Invoke Get-MgDirectoryRole -Times 0
+        Should -Invoke Get-MgRoleManagementDirectoryRoleDefinition -Times 0
+    }
+
+    It 'Reports optional installation failures without invoking import or abandoning other modules' {
+        Mock Get-Module { @() } -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
+        Mock Install-Module { Write-Error 'Proxy authentication required' }
+        Initialize-GraphModule -RequiredModules 'Microsoft.Graph.Users','Microsoft.Graph.Groups' -Optional | Should -BeFalse
+        Should -Invoke Import-Module -Times 0 -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
         Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Groups' }
+        Should -Invoke Write-Warn -Times 1 -Exactly -ParameterFilter { $Message -like '*Proxy authentication required*' }
     }
 
     It 'Resolves assignment IDs using live user and group lookup results' {

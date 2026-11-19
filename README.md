@@ -15,6 +15,7 @@ The legacy script is not a wrapper: its existing behavior is frozen, and it does
 
 | Migration concern | Supported exporter behavior |
 |-------------------|-----------------------------|
+| PowerShell runtime | Requires PowerShell 7.5+ (`pwsh`), including offline replay. Windows PowerShell 5.1 (`powershell.exe`) is not supported and stops at the native version prerequisite check. |
 | Output formats | No format switches produces HTML, enriched JSON and CSV. Specifying formats selects only those reports; use `-Html -Csv` or `-Html -CsvPivot` if callers previously relied on HTML always being added. |
 | Raw collection | Every connected run also writes a portable `*_raw.json`, independently of report-format selection. Offline replay does not write another snapshot. |
 | Output directory | Defaults to the current directory, not the script directory. `-OutputPath` must name an existing directory. |
@@ -57,7 +58,7 @@ Neither script changes tenant policies. Existing portable snapshots and legacy r
 
 ## Screenshots — sample data only
 
-These captures show version 3.7 using **Contoso Demo (sample data)**, so they do not show the 4.0 naming hints, NON-BLOCKING labels or comparison controls. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
+These pre-release development captures use **Contoso Demo (sample data)**. They may display development version labels and do not show the final 4.0 naming hints, NON-BLOCKING labels or comparison controls. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
 
 The sample policies illustrate report behavior, **not a recommended production baseline**. Both light and dark themes are shown.
 
@@ -99,23 +100,51 @@ The sample policies illustrate report behavior, **not a recommended production b
 ---
 ## Installation / Prereqs
 
-PowerShell 7.5+ is recommended. Connected collection uses Microsoft Graph modules; the script attempts to install missing modules in CurrentUser scope and import them. For managed environments, preinstall the modules using your approved process. You can install the full SDK using:
+**PowerShell 7.5 or later is required**, on Windows, macOS and Linux, including offline replay. Windows PowerShell 5.1 is not supported; neither are PowerShell 6 or 7.0–7.4. The script's native `#Requires -Version 7.5` check stops older runtimes before module installation, Graph sign-in or output generation, rather than allowing a partially successful run. This release does not attempt to restore 5.1 compatibility; it uses newer functionality such as script-safe JSON serialization with `ConvertTo-Json -EscapeHandling`.
+
+On Windows, PowerShell 7 installs alongside Windows PowerShell 5.1. Use **`pwsh`**, not `powershell.exe`, and select a PowerShell 7 terminal in your editor. Check and launch explicitly:
+
+```powershell
+pwsh -NoProfile -Command '$PSVersionTable.PSVersion'
+pwsh -NoProfile -File .\Export-CAPolicyWithRecs.ps1 -Html -NoBrowser
+```
+
+Install or update PowerShell using the [official installation instructions](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell). The frozen, deprecated script is not a supported 5.1 fallback.
+
+Connected collection requires **Microsoft.Graph.Authentication** and **Microsoft.Graph.Identity.SignIns**. A failure to install or import either stops the script before Graph sign-in or policy collection. For managed environments, preinstall the modules using your approved process **from the supported PowerShell runtime**. You can install the full SDK using:
 
 ```powershell
 Install-Module Microsoft.Graph -Scope CurrentUser
 ```
 
-To target only the required Microsoft Graph modules, you can specify them individually:
+To install only the core collection modules:
 
 ```powershell
 Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+Install-Module Microsoft.Graph.Identity.SignIns -Scope CurrentUser
+```
+
+Optional modules provide enrichment. DirectoryManagement is attempted for the tenant display name; the other modules load only when the exported policies reference the relevant assignment types:
+
+| Optional module | Used for |
+|-----------------|----------|
+| Microsoft.Graph.Identity.DirectoryManagement | Tenant display name and active directory-role names |
+| Microsoft.Graph.Users | Referenced user names |
+| Microsoft.Graph.Groups | Referenced group names |
+| Microsoft.Graph.Applications | Referenced application/service-principal names |
+| Microsoft.Graph.Identity.Governance | Referenced role definitions/templates and terms of use |
+
+To preinstall all optional enrichment modules:
+
+```powershell
 Install-Module Microsoft.Graph.Users -Scope CurrentUser
 Install-Module Microsoft.Graph.Groups -Scope CurrentUser
 Install-Module Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser
-Install-Module Microsoft.Graph.Identity.SignIns -Scope CurrentUser
+Install-Module Microsoft.Graph.Applications -Scope CurrentUser
 Install-Module Microsoft.Graph.Identity.Governance -Scope CurrentUser
-Install-Module Microsoft.Graph.DeviceManagement.Enrollment -Scope CurrentUser
 ```
+
+For requested modules, the exporter imports installed copies without accessing PSGallery or changing repository trust. If a module is missing it attempts `Install-Module` from PSGallery in CurrentUser scope. An optional module failure produces one warning for that module, skips its dependent Graph lookups, and preserves affected IDs. Other collection/enrichment continues; unavailable tenant naming uses `UnknownTenant`. Built-in role-name fallbacks can still resolve known roles. `-NoRecommendations` does not disable assignment lookups. Offline runs skip all Graph module initialization.
 
 When the script runs it will request admin consent to allow it to use the Microsoft Graph command line tools, if this not already granted. If you do not have permission to grant admin consent, you will need to work with your Entra ID administrator to obtain the necessary permissions.
 
@@ -294,7 +323,7 @@ Policy JSON embedded in HTML is escaped for script contexts; names, IDs and depl
 
 Alongside the requested reports, this automatically creates a timestamped file such as `CAExportRecs_ExampleTenant_20261118_090000_raw.json`. No second collection command is needed. This snapshot is a versioned object containing a `Policies` array and supporting data, not a bare Graph policy array.
 
-**Copy only the snapshot and `Export-CAPolicyWithRecs.ps1` to the other computer.** No sidecar files or Microsoft Graph modules are needed there. With PowerShell available, regenerate any report formats:
+**Copy only the snapshot and `Export-CAPolicyWithRecs.ps1` to the other computer.** No sidecar files or Microsoft Graph modules are needed there. PowerShell 7.5+ is still required; regenerate any report formats:
 
 ```powershell
 ./Export-CAPolicyWithRecs.ps1 `
@@ -315,6 +344,7 @@ Real exports and snapshots can contain sensitive identity, application, and netw
 
 | Issue | Resolution |
 |-------|-----------|
+| Script requires a newer PowerShell version | Launch with PowerShell 7.5+ using `pwsh -NoProfile -File .\Export-CAPolicyWithRecs.ps1`. `powershell.exe` starts Windows PowerShell 5.1 even when PowerShell 7 is installed. The version guard intentionally stops unsupported runtimes before any collection; it also applies offline. |
 | Missing consent or empty policy list | Confirm Policy.Read.All, Directory.Read.All, RoleManagement.Read.All, and an appropriate Entra read role. Required scopes alone do not grant directory roles. Review the connection/API error before retrying. |
 | Unresolved user/group/role IDs | Review lookup warnings, granted permissions, and whether the referenced object still exists. Unresolved IDs are retained rather than replaced with blank or guessed names. |
 | More assessments need review than expected | Read the matching evidence and scope caveats. Exclusions, restricted conditions, incomplete metadata, and single-policy snapshots can require review without proving the policy ineffective. Optional applicability reviews are separate from Attention. |
@@ -325,6 +355,8 @@ Real exports and snapshots can contain sensitive identity, application, and netw
 | A comparison has matches but the table is empty | The comparison totals cover the export before search/deployment filters. Clear the search, select All policies, or clear the comparison to inspect the full set. |
 | Two identical names do not highlight together | Matching uses the original entity type and ID, not names. Different users/groups can share a display name; a user and a group never become equivalent merely because their names or IDs match. |
 | Naming hints seem too cautious | Expand the hint and compare it with the original policy JSON and intended scope. Hints are English-language heuristics, not effective-access findings; retain an intentional name or change it manually only after review. |
+| Graph module installation reports XML/document/feed errors | A proxy authentication/block page or TLS inspection can interfere with PSGallery responses. Check the original error with `Find-Module Microsoft.Graph.Users -Repository PSGallery -Verbose`, and use approved network/proxy configuration or preinstalled modules. Do not disable certificate validation. Core failures stop collection; optional failures skip that module's lookups with IDs retained. |
+| A Graph module is installed but cannot import | Run `Import-Module <module-name> -ErrorAction Stop -Verbose` in a clean PowerShell session to inspect assembly/dependency/version failures. Repair the installation using your approved process; package-feed access alone does not establish that a module can load. |
 
 ---
 ## Contributing
@@ -343,13 +375,11 @@ Pester and PSScriptAnalyzer are development dependencies, not offline-export req
 ---
 ## Version History
 
+Development iterations after 3.3 are consolidated into the 4.0 release below.
+
 | Version | Highlights |
 |---------|-----------|
-| 4.0 | WithRecs is the supported exporter; baseline fully deprecated and retained only for legacy callers. Verified `-TenantID` selection, raw-policy naming hints and optional naming suggestions, NON-BLOCKING terminology, ID/type-based assignment highlighting, exact-cell comparison, include/exclude/deployment counts, and combined comparison/search/state filters. Review hardening adds script-safe JSON and encoded report attributes, complete single-policy JSON views, false/unset boolean comparison parity, negation-aware naming hints, SDK-aware grant suggestions and block-search corrections. |
-| 3.7 | Automatic portable offline snapshots on every connected run, including complete Named Locations, resolved names, authentication strengths, capture metadata, emergency-account IDs, and partial-export limits; backward-compatible policy-array loading and explicit snapshot validation. |
-| 3.6 | Paginated Named Locations inventory with explicit offline/failure states; post-connect scope verification; four recommendation views plus an Assessment dropdown and preference migration; improved Summary formatting; removed obsolete CSV parameter warnings. |
-| 3.5 | Fixed false restrictions from empty Graph SDK models and separated optional applicability reviews from Attention; four application-scoped templates with match/deployment measurements and resource/filter evidence; refreshed all tabs with responsive light/dark layouts, contained sticky scrolling and combined filters. |
-| 3.4 | 28 Microsoft-backed recommendation assessments with state/scope/grant-aware evaluation, prerequisites/background links, escaped evidence, emergency-account IDs, and optional advanced-scenario reviews. |
+| 4.0 | **Supported exporter:** WithRecs replaces the fully deprecated baseline; PowerShell 7.5+ is required, with guarded core/optional Graph modules and verified tenant/scope selection. **Assessments:** 32 Microsoft-backed, state/scope/grant-aware assessments and templates with prerequisites, background, links and escaped evidence; emergency-account review; verified authentication strengths; SDK empty-container fixes; separate protection, optional-template and operational views with an Assessment dropdown and preference migration. **Portable collection:** automatic versioned snapshots include raw policies, complete paginated Named Locations and retrieval status, resolved names, authentication strengths, tenant/capture metadata, emergency-account IDs and partial-export limits; legacy policy arrays remain supported with explicit input validation. **Report and exports:** responsive light/dark tabs, improved Summary metrics, contained sticky scrolling, naming hints and optional suggestions, NON-BLOCKING terminology, ID/type-based assignment highlighting, exact-cell comparisons, include/exclude/deployment counts and combined filters; removed obsolete CSV parameter warnings. **Review hardening:** script-safe JSON and encoded attributes, complete single-policy JSON views, false/unset comparison parity, negation-aware naming hints, SDK-aware grant suggestions and block-search corrections. |
 | 3.3 | Offline mode (`-RawInputFile`), recommendations array inlined (removed external data file), improved Recommendations tab styling, simplified HTML sanitizer (prevents escaped structural tags), removed obsolete quiet behavior, minor accessibility & layout refinements. |
 | 3.2 | Overlap filter chip + row highlighting; Phish‑resistant MFA evaluation using AllowedCombinations; improved admin role GUID resolution; authentication strength caching; CA‑05 logic hardened; null overlap guard fix. |
 | 3.1 | Pivot CSV dataset restored (wide format); improved role resolution (template & definition IDs), GUID parameter validation, duplicate detection hashing improvements, accessibility & JSON copy utilities. |

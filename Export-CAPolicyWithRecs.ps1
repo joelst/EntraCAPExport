@@ -91,6 +91,8 @@
 .NOTES
   Author:  Douglas Baker @dougsbaker
   Version: 4.0
+  Requires PowerShell 7.5 or later (pwsh). Windows PowerShell 5.1 (powershell.exe) is not supported.
+  Run: pwsh -NoProfile -File .\Export-CAPolicyWithRecs.ps1
 
 ############################################################################
 This sample script is not supported under any standard support program or service.
@@ -100,6 +102,8 @@ https://creativecommons.org/licenses/by-nc-sa/4.0/
 ############################################################################
 
 #>
+
+#Requires -Version 7.5
 
 [CmdletBinding()]
 # Suppress PSAvoidLongLines for unavoidable embedded HTML/URLs
@@ -464,10 +468,15 @@ function Initialize-GraphModule {
 .SYNOPSIS
   Ensure required PowerShell modules are installed and loadable for the current user.
 .DESCRIPTION
-  Verifies presence of Microsoft Graph modules used by this script and installs them to CurrentUser scope when missing.
-  Attempts to trust PSGallery and install the NuGet provider when necessary. Imports modules after install.
+  Loads core Graph modules or explicitly requested lookup modules, installing missing modules in CurrentUser scope.
+  Stops on required-module failures. Optional failures warn once per module and return false so callers skip lookups.
+  Does not contact the package repository when all requested modules are already installed.
 .PARAMETER RequiredModules
-  The list of module names to validate/install. Defaults to Microsoft Graph modules used by this script.
+  Module names to validate/install. Defaults to Authentication and Identity.SignIns for connected collection.
+.PARAMETER Optional
+  Return false instead of throwing if any requested module cannot be installed or imported.
+.OUTPUTS
+  Boolean indicating whether every requested module loaded successfully.
 .EXAMPLE
   Initialize-GraphModule
 #>
@@ -475,66 +484,29 @@ function Initialize-GraphModule {
   param(
     [string[]]$RequiredModules = @(
       'Microsoft.Graph.Authentication',
-      'Microsoft.Graph.Users',
-      'Microsoft.Graph.Groups',
-      'Microsoft.Graph.Identity.DirectoryManagement',
-      'Microsoft.Graph.Identity.SignIns',
-      'Microsoft.Graph.Identity.Governance',
-      'Microsoft.Graph.DeviceManagement.Enrollment'
-    )
+      'Microsoft.Graph.Identity.SignIns'
+    ),
+    [switch]$Optional
   )
 
-  try {
-    # Prefer TLS 1.2 for gallery operations (safe no-op on newer PowerShell)
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-  }
-  catch {
-    Write-Verbose 'Failed to set SecurityProtocol to TLS 1.2; proceeding with defaults.'
-  }
-
-  # Ensure NuGet provider exists (for Install-Module)
-  try {
-    $nuget = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue
-    if (-not $nuget) {
-      Write-Info 'Installing NuGet package provider (CurrentUser)'
-      Install-PackageProvider -Name NuGet -Scope CurrentUser -Force -MinimumVersion '2.8.5.201' -ErrorAction Stop | Out-Null
-    }
-  }
-  catch {
-    Write-Warn ('Failed to install NuGet provider: {0}' -f $_.Exception.Message)
-  }
-
-  # Ensure PSGallery is available and trusted
-  try {
-    $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction Stop
-    if ($repo.InstallationPolicy -ne 'Trusted') {
-      try {
-        Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction Stop 
-      }
-      catch {
-        Write-Warn 'Could not set PSGallery as Trusted. You may be prompted during install.' 
-      }
-    }
-  }
-  catch {
-    Write-Warn 'PowerShell Gallery (PSGallery) not found. Module installation may fail until the repository is available.'
-  }
-
+  $allLoaded = $true
   foreach ($m in $RequiredModules) {
-    $installed = Get-Module -ListAvailable -Name $m
-    if (-not $installed) {
-      Write-Info ('Installing module: {0} (CurrentUser)' -f $m)
-      try {
-        # Hardened install: remove -SkipPublisherCheck / -AllowClobber; prompt avoidance left to repo trust
-        Install-Module -Name $m -Scope CurrentUser -Force -ErrorAction Stop
+    try {
+      $installed = Get-Module -ListAvailable -Name $m -ErrorAction Stop
+      if (-not $installed) {
+        Write-Info ('Installing module: {0} (CurrentUser)' -f $m)
+        Install-Module -Name $m -Repository PSGallery -Scope CurrentUser -Force -ErrorAction Stop
       }
-      catch {
-        Write-Warn ("Failed to install module '{0}': {1}" -f $m, $_.Exception.Message)
-        continue
-      }
+      Import-Module -Name $m -Global -ErrorAction Stop
     }
-    try { Import-Module -Name $m -Force -ErrorAction Stop } catch { Write-Warn ("Failed to import module '{0}': {1}" -f $m, $_.Exception.Message) }
+    catch {
+      $message = "Graph module '$m' could not be loaded: $($_.Exception.Message). Preinstall/import this module in a clean PowerShell session; for download/XML/document errors check PSGallery access, proxy authentication and TLS inspection. Do not disable certificate validation."
+      if (-not $Optional) { throw "$message Required Graph collection cannot continue." }
+      Write-Warn "$message Optional enrichment using this module is skipped; affected IDs remain unresolved."
+      $allLoaded = $false
+    }
   }
+  return $allLoaded
 }
 
 function Connect-GraphContext {
@@ -1626,7 +1598,7 @@ $IsPartialSnapshot = [bool]$PolicyID
 if ($RawInputFile -and $TenantID) { throw 'TenantID cannot be combined with RawInputFile; offline reports use the captured tenant.' }
 if (-not $script:OfflineMode) {
   # Ensure required modules are present before attempting to connect
-  Initialize-GraphModule
+  $null = Initialize-GraphModule
   Connect-GraphContext -TenantID $TenantID
 }
 else {
@@ -1700,7 +1672,12 @@ if ($RawInputFile) {
 }
 else {
   Write-Info 'Retrieving tenant information'
-  $TenantName = (Get-MgOrganization -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DisplayName)
+  $DirectoryModuleAvailable = Initialize-GraphModule -RequiredModules 'Microsoft.Graph.Identity.DirectoryManagement' -Optional
+  $TenantName = if ($DirectoryModuleAvailable) {
+    Invoke-SafeGet -FailureMessage 'Could not retrieve tenant display name; using UnknownTenant' {
+      Get-MgOrganization -ErrorAction Stop | Select-Object -First 1 -ExpandProperty DisplayName
+    }
+  }
   if (-not $TenantName) { $TenantName = 'UnknownTenant' }
   $Date = (Get-Date).ToUniversalTime().ToString('u')
   Write-Info 'Retrieving Conditional Access policies'
@@ -1794,7 +1771,11 @@ if ($script:OfflineMode) {
   }
 }
 else {
-  foreach ($id in $userIds) {
+  $usersAvailable = if ($userIds.Count) { Initialize-GraphModule -RequiredModules 'Microsoft.Graph.Users' -Optional } else { $false }
+  $groupsAvailable = if ($groupIds.Count) { Initialize-GraphModule -RequiredModules 'Microsoft.Graph.Groups' -Optional } else { $false }
+  $appsAvailable = if ($appIds.Count) { Initialize-GraphModule -RequiredModules 'Microsoft.Graph.Applications' -Optional } else { $false }
+  $governanceAvailable = if ($roleIds.Count -or $touIds.Count) { Initialize-GraphModule -RequiredModules 'Microsoft.Graph.Identity.Governance' -Optional } else { $false }
+  foreach ($id in $(if ($usersAvailable) { $userIds })) {
     if ($id -and ($id -match '^[0-9a-fA-F\-]{36}$')) {
       $obj = Invoke-SafeGet -FailureMessage "Could not resolve user '$id'; keeping its ID" {
         $user = Get-MgUser -UserId $id -Property Id, DisplayName -ErrorAction Stop
@@ -1804,7 +1785,7 @@ else {
       if ($obj) { $UserMap[$id] = $obj.DisplayName }
     }
   }
-  foreach ($id in $groupIds) {
+  foreach ($id in $(if ($groupsAvailable) { $groupIds })) {
     $obj = Invoke-SafeGet -FailureMessage "Could not resolve group '$id'; keeping its ID" {
       $group = Get-MgGroup -GroupId $id -Property Id, DisplayName -ErrorAction Stop
       if ([string]::IsNullOrWhiteSpace($group.DisplayName)) { throw 'Graph returned no display name. Check Directory.Read.All consent and whether the group still exists.' }
@@ -1833,7 +1814,9 @@ else {
     'fe930be7-5e62-47db-91af-98c3a49a38b1' = 'User Administrator'
   }
 
-  $dirRoles = Invoke-SafeGet { Get-MgDirectoryRole -All }
+  $dirRoles = if ($roleIds.Count -and $DirectoryModuleAvailable) {
+    Invoke-SafeGet { Get-MgDirectoryRole -All -ErrorAction Stop }
+  }
   if ($dirRoles) {
     foreach ($r in $dirRoles) {
       if ($r.id -and -not $roleLookup.ContainsKey($r.id)) { $roleLookup[$r.id] = $r.displayName }
@@ -1844,7 +1827,9 @@ else {
     foreach ($kv in $commonRoleTemplates.GetEnumerator()) { $roleLookup[$kv.Key] = $kv.Value }
   }
 
-  $roleDefs = Invoke-SafeGet { Get-MgRoleManagementDirectoryRoleDefinition -All -Property Id, DisplayName, TemplateId }
+  $roleDefs = if ($roleIds.Count -and $governanceAvailable) {
+    Invoke-SafeGet { Get-MgRoleManagementDirectoryRoleDefinition -All -Property Id, DisplayName, TemplateId -ErrorAction Stop }
+  }
   if ($roleDefs) {
     foreach ($rd in $roleDefs) {
       if ($rd.Id -and -not $roleLookup.ContainsKey($rd.Id)) { $roleLookup[$rd.Id] = $rd.DisplayName }
@@ -1860,11 +1845,11 @@ else {
       $RoleMap[$id] = $roleLookup[$id]
     }
     else {
-      $obj = Invoke-SafeGet { Get-MgDirectoryRole -DirectoryRoleId $id -Property Id, DisplayName }
+      $obj = if ($DirectoryModuleAvailable) { Invoke-SafeGet { Get-MgDirectoryRole -DirectoryRoleId $id -Property Id, DisplayName -ErrorAction Stop } }
       if ($obj) { $RoleMap[$id] = $obj.DisplayName } elseif ($commonRoleTemplates.ContainsKey($id)) { $RoleMap[$id] = $commonRoleTemplates[$id] }
     }
   }
-  foreach ($id in $appIds) {
+  foreach ($id in $(if ($appsAvailable) { $appIds })) {
     if (Test-IsGuid $id) {
       $obj = Invoke-SafeGet { Get-MgServicePrincipal -ServicePrincipalId $id -Property Id, DisplayName, AppId }
       if ($obj) { $AppMap[$id] = $obj.DisplayName }
@@ -1887,7 +1872,7 @@ else {
       }
     }
   }
-  foreach ($id in $touIds) {
+  foreach ($id in $(if ($governanceAvailable) { $touIds })) {
     if (Test-IsGuid $id) {
       $obj = Invoke-SafeGet { Get-MgAgreement -AgreementId $id -Property Id, DisplayName }
       if ($obj) { $TouMap[$id] = $obj.DisplayName }
@@ -3428,7 +3413,7 @@ document.addEventListener('DOMContentLoaded', function(){
   $fullPage = $htmlDoc + $HtmlParts + $fallbackToggle + '</body></html>'
   $fullPage | Out-File $Launch -Encoding UTF8
   if (-not $NoBrowser) {
-    if ($IsWindows -or $PSVersionTable.PSVersion.Major -le 5) {
+    if ($IsWindows) {
       Start-Process $Launch
     }
     elseif ($IsMacOS) {
