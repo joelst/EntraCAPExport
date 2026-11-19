@@ -3,6 +3,16 @@
 
 <# Each Describe defines needed helper functions in its own BeforeAll to work with Pester V5 discovery (which does not execute top-level code). #>
 
+Describe 'Supported PowerShell runtime' {
+    It 'Declares a native version requirement before script execution' {
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1", [ref]$null, [ref]$errors)
+        @($errors).Count | Should -Be 0
+        $ast.ScriptRequirements.RequiredPSVersion | Should -Be ([version]'7.5')
+    }
+}
+
 Describe 'State-aware Microsoft recommendation assessments' {
     BeforeAll {
         $source = Get-Content -LiteralPath "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1" -Raw
@@ -725,6 +735,217 @@ Describe 'Summary table presentation' {
     }
 }
 
+Describe 'Naming hints and assignment identity' {
+    BeforeAll {
+        $source = Get-Content -LiteralPath "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1" -Raw
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
+        $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+    }
+
+    BeforeEach {
+        $script:OfflineMode = $true
+        $script:AuthStrengthCache = @{}
+        $script:AuthStrengthCachePopulated = $true
+        $policy = @{
+            displayName = 'Block legacy authentication'; state = 'enabled'
+            conditions = @{ users = @{ includeUsers = @('All') } }
+            grantControls = @{ operator = 'OR'; builtInControls = @('block') }
+        }
+    }
+
+    It 'Flags a block name with a non-block grant without flagging a correctly configured block' {
+        @(Get-CaNamingHint $policy).Count | Should -Be 0
+        $policy.grantControls.builtInControls = @('mfa')
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'no Block grant'
+    }
+
+    It 'Recognizes compliance-based unmanaged-device restrictions without claiming enforcement for report-only policies' {
+        $policy.displayName = 'Block unmanaged devices'
+        $policy.grantControls.builtInControls = @('compliantDevice')
+        @(Get-CaNamingHint $policy).Count | Should -Be 0
+        $policy.state = 'enabledForReportingButNotEnforced'
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'not enabled for enforcement'
+        $policy.grantControls.builtInControls += 'mfa'
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'no Block grant'
+    }
+
+    It 'Warns about non-enforced block policies in <State>' -TestCases @(
+        @{ State = 'disabled' }
+        @{ State = 'enabledForReportingButNotEnforced' }
+    ) {
+        param($State)
+        $policy.state = $State
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'not enabled for enforcement'
+    }
+
+    It 'Distinguishes mandatory MFA from OR alternatives and unverified strength names' {
+        $policy.displayName = 'Require MFA'
+        $policy.grantControls.builtInControls = @('mfa')
+        @(Get-CaNamingHint $policy).Count | Should -Be 0
+        $policy.grantControls.builtInControls += 'compliantDevice'
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'every grant path'
+        $policy.grantControls.operator = 'AND'
+        @(Get-CaNamingHint $policy).Count | Should -Be 0
+        $policy.grantControls = @{ authenticationStrength = @{ displayName = 'MFA' } }
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'not verified'
+        $policy.grantControls.authenticationStrength.id = '00000000-0000-0000-0000-000000000002'
+        @(Get-CaNamingHint $policy).Count | Should -Be 0
+    }
+
+    It 'Calls out All users scope mismatches and explicit exceptions' {
+        $policy.displayName = 'All users'
+        @(Get-CaNamingHint $policy).Count | Should -Be 0
+        $policy.conditions.users.excludeGroups = @('excluded')
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'exclusions'
+        $policy.conditions.users.includeUsers = @()
+        $policy.conditions.users.includeGroups = @('target')
+        (Get-CaNamingHint $policy) -join ' ' | Should -Match 'does not include All'
+    }
+
+    It 'Recognizes structured naming tokens and avoids suggesting mandatory controls for OR alternatives' {
+        $policy.displayName = 'CA001-AllUsers-RequireMFA'
+        $policy.conditions.users.includeUsers = @('specific-user')
+        $policy.grantControls.builtInControls = @('mfa', 'compliantDevice')
+        $hints = @(Get-CaNamingHint $policy)
+        $hints.Count | Should -Be 2
+        ($hints -join ' ') | Should -Match 'every grant path'
+        $suggestion = Get-RecommendedPolicyName $policy
+        $suggestion | Should -Match 'AlternativeControls'
+        $suggestion | Should -Not -Match 'RequireMFA'
+    }
+
+    It 'Distinguishes negated block names from an actual claim in <Name>' -TestCases @(
+        @{ Name = 'Non-Blocking MFA'; HintCount = 0 }
+        @{ Name = 'Do not block guests'; HintCount = 0 }
+        @{ Name = "Don't block guests"; HintCount = 0 }
+        @{ Name = 'Legacy authentication blocked'; HintCount = 1 }
+        @{ Name = 'Block legacy but do not block modern authentication'; HintCount = 1 }
+    ) {
+        param($Name, $HintCount)
+        $policy.displayName = $Name
+        $policy.grantControls.builtInControls = @('mfa')
+        @(Get-CaNamingHint $policy).Count | Should -Be $HintCount
+    }
+
+    It 'Names configured grant controls rather than treating them as session-only policies' {
+        $policy.grantControls = @{ customAuthenticationFactors = @('factor-1') }
+        Get-RecommendedPolicyName $policy | Should -Match 'RequireCustomAuth'
+        $policy.grantControls = @{ builtInControls = @('riskRemediation') }
+        Get-RecommendedPolicyName $policy | Should -Match 'RequireRiskRemediation'
+        $policy.grantControls = @{ builtInControls = @('unknownFutureValue') }
+        Get-RecommendedPolicyName $policy | Should -Match 'ReviewGrantControls'
+        $policy.grantControls = @{}
+        Get-RecommendedPolicyName $policy | Should -Match 'NonBlocking'
+    }
+
+    It 'Honors SDK assignment exclusions and the configured <Operator> grant operator in suggestions' -TestCases @(
+        @{ Operator = 'AND'; Control = 'RequireMFA-Plus' }
+        @{ Operator = 'OR'; Control = 'AlternativeControls' }
+    ) {
+        param($Operator, $Control)
+        $policy.conditions.users = [pscustomobject]@{
+            IncludeUsers = @('All'); ExcludeGroups = @()
+            AdditionalProperties = @{ excludeGroups = @('group-1') }
+        }
+        $policy.grantControls = [pscustomobject]@{
+            BuiltInControls = @('mfa', 'compliantDevice'); Operator = $null
+            AdditionalProperties = @{ operator = $Operator }
+        }
+        $suggestion = Get-RecommendedPolicyName $policy
+        $suggestion | Should -Match 'AllUsers-Exceptions'
+        $suggestion | Should -Match $Control
+    }
+
+    It 'Preserves type and IDs for same-name entities and include/exclude matches' {
+        $policy.conditions.users = @{
+            includeUsers = @('user-1'); includeGroups = @('group-1', 'group-2'); includeRoles = @('role-1')
+            excludeGroups = @('group-1')
+        }
+        $lookups = @{ users = @{ 'user-1' = 'Shared name' }; groups = @{ 'group-1' = 'Shared name'; 'group-2' = 'Shared name' }; roles = @{} }
+        $included = @(Get-CaAssignmentToken $policy 'Included Users' $lookups)
+        $excluded = @(Get-CaAssignmentToken $policy 'Excluded Users' $lookups)
+        $included.Count | Should -Be 4
+        @($included | Where-Object Label -eq 'Shared name').Count | Should -Be 3
+        $excluded[0].Id | Should -Be 'group-1'
+        $excluded[0].Type | Should -Be 'groups'
+        $excluded[0].Direction | Should -Be 'exclude'
+        ($included | Where-Object Type -eq 'roles').Label | Should -Be 'role-1'
+    }
+
+    It 'Reads assignment IDs from populated AdditionalProperties instead of empty SDK containers' {
+        $policy.conditions = [pscustomobject]@{
+            Users = [pscustomobject]@{ IncludeUsers = @() }
+            AdditionalProperties = @{ users = @{ includeUsers = @('user-1') } }
+        }
+        (Get-CaAssignmentToken $policy 'Included Users' @{}).Id | Should -Be 'user-1'
+    }
+
+    It 'Keeps different guest tenant selectors distinct rather than matching only their display label' {
+        $policy.conditions.users.includeGuestsOrExternalUsers = @{
+            guestOrExternalUserTypes = 'b2bCollaborationGuest'
+            externalTenants = @{ membershipKind = 'enumerated'; members = @('tenant-1') }
+        }
+        $first = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $policy.conditions.users.includeGuestsOrExternalUsers.externalTenants.members = @('tenant-2')
+        $second = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $first.Label | Should -Be $second.Label
+        $first.Id | Should -Not -Be $second.Id
+    }
+
+    It 'Matches equivalent guest selectors regardless of property, guest-type, or tenant-member ordering' {
+        $policy.conditions.users.includeGuestsOrExternalUsers = [ordered]@{
+            guestOrExternalUserTypes = 'b2bCollaborationGuest, internalGuest'
+            externalTenants = [ordered]@{ membershipKind = 'enumerated'; members = @('TENANT-2', 'tenant-1', 'tenant-1') }
+            futureRestriction = [ordered]@{ enabled = $false; modes = @('one') }
+        }
+        $first = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $policy.conditions.users.includeGuestsOrExternalUsers = [pscustomobject]@{
+            FutureRestriction = [pscustomobject]@{ Modes = @('one'); Enabled = $false }
+            ExternalTenants = [pscustomobject]@{
+                Members = @()
+                MembershipKind = 'enumerated'
+                AdditionalProperties = @{ members = @('tenant-1', 'tenant-2') }
+            }
+            GuestOrExternalUserTypes = ' internalGuest, B2BCollaborationGuest, internalGuest '
+        }
+        $second = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $first.Id | Should -BeExactly $second.Id
+        $canonical = $second.Id | ConvertFrom-Json -AsHashtable
+        $canonical.futurerestriction.enabled | Should -BeFalse
+        ($canonical.futurerestriction.modes -is [array]) | Should -BeTrue
+        $canonical.futurerestriction.modes.Count | Should -Be 1
+    }
+
+    It 'Preserves <Field> restrictions when comparing guest selectors' -TestCases @(
+        @{ Field = 'membership kind' }
+        @{ Field = 'guest types' }
+        @{ Field = 'additional flag' }
+        @{ Field = 'additional array order' }
+        @{ Field = 'empty versus singleton array' }
+    ) {
+        param($Field)
+        $selector = @{
+            guestOrExternalUserTypes = 'internalGuest'
+            externalTenants = @{ membershipKind = 'enumerated'; members = @('tenant-1') }
+            futureRestriction = @{ enabled = $false; modes = @('one', 'two'); extra = @() }
+        }
+        $policy.conditions.users.includeGuestsOrExternalUsers = $selector
+        $first = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        switch ($Field) {
+            'membership kind' { $selector.externalTenants.membershipKind = 'all' }
+            'guest types' { $selector.guestOrExternalUserTypes = 'b2bCollaborationGuest' }
+            'additional flag' { $selector.futureRestriction.enabled = $true }
+            'additional array order' { $selector.futureRestriction.modes = @('two', 'one') }
+            'empty versus singleton array' { $selector.futureRestriction.extra = @('one') }
+        }
+        $second = Get-CaAssignmentToken $policy 'Included Users' @{} | Where-Object Type -eq 'guest-selector'
+        $first.Id | Should -Not -Be $second.Id
+    }
+}
+
 Describe 'Graph connection scope verification' {
     BeforeAll {
         $source = Get-Content -LiteralPath "$PSScriptRoot/../Export-CAPolicyWithRecs.ps1" -Raw
@@ -734,13 +955,14 @@ Describe 'Graph connection scope verification' {
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Connect-GraphContext', 'Write-Info')
         }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
         function Get-MgContext { [CmdletBinding()] param() }
-        function Connect-MgGraph { [CmdletBinding()] param([string[]]$Scopes) }
+        function Connect-MgGraph { [CmdletBinding()] param([string[]]$Scopes, [string]$TenantId) }
     }
 
     BeforeEach {
         $script:ContextReads = 0
         $validContext = [pscustomobject]@{
             Account = 'test@example.invalid'
+            TenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
             Scopes = @('Policy.Read.All', 'Directory.Read.All', 'RoleManagement.Read.All')
         }
         Mock Connect-MgGraph {}
@@ -752,6 +974,26 @@ Describe 'Graph connection scope verification' {
 
         Should -Invoke Connect-MgGraph -Times 0
         Should -Invoke Get-MgContext -Times 1 -Exactly
+    }
+
+    It 'Keeps a verified connection to the requested tenant' {
+        Connect-GraphContext -TenantID $validContext.TenantId
+        Should -Invoke Connect-MgGraph -Times 0
+    }
+
+    It 'Reconnects to a requested tenant when the cached tenant differs' {
+        Mock Get-MgContext {
+            if ($script:ContextReads++ -eq 0) {
+                [pscustomobject]@{ Account = 'test@example.invalid'; TenantId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'; Scopes = $validContext.Scopes }
+            }
+            else { $validContext }
+        }
+        Connect-GraphContext -TenantID $validContext.TenantId
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $TenantId -eq $validContext.TenantId }
+    }
+
+    It 'Rejects sign-in to a tenant other than the requested tenant' {
+        { Connect-GraphContext -TenantID 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' } | Should -Throw '*instead of requested tenant*'
     }
 
     It 'Reads and validates the new context after an initial sign-in' {
@@ -1011,16 +1253,146 @@ Describe 'Offline recommendation exports' {
         $html | Should -Match "id='rec-filter-empty'"
         $html | Should -Match "id='tab-locations'"
         $html | Should -Match "id='panel-locations'"
+        $html | Should -Match "id='match-only'"
+        $html | Should -Match "data-entity-type='users' data-entity-id='all'"
+        $html | Should -Match "data-compare-field='Block'"
+        $html | Should -Match 'NON-BLOCKING'
+        $html | Should -Not -Match '>ALLOW<'
         $html | Should -Match 'not included in raw policy snapshots'
         @(Get-ChildItem $out.FullName -Filter '*.json').Count | Should -Be 1
         @(Get-ChildItem $out.FullName -Filter '*.csv').Count | Should -Be 2
+        (Import-Csv (Get-ChildItem $out.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv').FullName)[0].PSObject.Properties.Name | Should -Contain 'Naming Hints'
         foreach ($csv in Get-ChildItem $out.FullName -Filter '*.csv') {
             Get-Content $csv.FullName -TotalCount 1 | Should -Not -Match '^#TYPE'
         }
+
         $policyCsv = Get-ChildItem $out.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv'
         @(Import-Csv $policyCsv.FullName).Count | Should -Be 3
         $json = Get-ChildItem $out.FullName -Filter '*.json' | Where-Object Name -NotLike '*_raw.json'
         @(Get-Content $json.FullName -Raw | ConvertFrom-Json).Count | Should -Be 3
+    }
+
+    It 'Escapes naming and assignment labels while preserving raw comparison identity' {
+        $named = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $named.displayName = 'Block <review>'
+        $named.conditions.users.includeGroups = @('group-1')
+        $snapshot = New-TestPortableSnapshot -Policies @($named)
+        $snapshot.Lookups.Groups['group-1'] = '<script>& "$&'
+        $inputPath = Join-Path $TestDrive 'naming-input.json'
+        $snapshot | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $inputPath
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'naming-output')
+        & $exportScript -RawInputFile $inputPath -OutputPath $out.FullName -Html -NoBrowser -NoRecommendations
+        $html = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
+        $html | Should -Match 'Block &lt;review&gt;'
+        $html | Should -Match 'no Block grant'
+        $html | Should -Match 'groups: &lt;script&gt;&amp; &quot;\$&amp;'
+        $html | Should -Match "data-entity-type='groups' data-entity-id='group-1'"
+        $html | Should -Match 'Suggested name \(heuristic\)'
+    }
+
+    It 'Rejects tenant selection with offline input' {
+        { & $exportScript -RawInputFile $rawPath -TenantID 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' } |
+            Should -Throw '*TenantID cannot be combined with RawInputFile*'
+    }
+
+    It 'Preserves positional policy selection with offline input' {
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'positional-policy')
+        & $exportScript $device.id -RawInputFile $rawPath -OutputPath $out.FullName -Json -NoBrowser
+        $json = Get-ChildItem $out.FullName -Filter '*.json'
+        $selected = @(Get-Content -LiteralPath $json.FullName -Raw | ConvertFrom-Json)
+        $selected.Count | Should -Be 1
+        $selected[0].PolicyId | Should -Be $device.id
+    }
+
+    It 'Stops a connected run before Graph calls when a core module import fails' {
+        Mock Get-Module { [pscustomobject]@{ Name = $Name } }
+        Mock Import-Module { throw 'Invalid document element' } -ParameterFilter { $Name -like 'Microsoft.Graph.*' }
+        Mock Get-MgContext { throw 'Must not connect' }
+        Mock Get-MgIdentityConditionalAccessPolicy { throw 'Must not collect' }
+        { & $exportScript -OutputPath $TestDrive -Csv } | Should -Throw '*Required Graph collection cannot continue*'
+        Should -Invoke Get-MgContext -Times 0
+        Should -Invoke Get-MgIdentityConditionalAccessPolicy -Times 0
+    }
+
+    It 'Exports policies and snapshots with unresolved IDs when optional module imports fail' {
+        $livePolicy = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $userId = '66666666-6666-6666-6666-666666666666'
+        $groupId = '77777777-7777-7777-7777-777777777777'
+        $livePolicy.conditions.users.includeUsers = @($userId)
+        $livePolicy.conditions.users.includeGroups = @($groupId)
+        Mock Get-Module { [pscustomobject]@{ Name = $Name } }
+        Mock Import-Module {} -ParameterFilter { $Name -like 'Microsoft.Graph.*' }
+        Mock Import-Module { throw 'Invalid document element from proxy' } -ParameterFilter {
+            $Name -in @('Microsoft.Graph.Users', 'Microsoft.Graph.Identity.DirectoryManagement')
+        }
+        Mock Get-MgContext {
+            [pscustomobject]@{ Account = 'test@example.invalid'; Scopes = @('Policy.Read.All', 'Directory.Read.All', 'RoleManagement.Read.All') }
+        }
+        Mock Get-MgOrganization { throw 'Unavailable optional command must not run' }
+        Mock Get-MgUser { throw 'Unavailable optional command must not run' }
+        Mock Get-MgGroup { [pscustomobject]@{ DisplayName = 'Resolved group' } }
+        Mock Get-MgIdentityConditionalAccessPolicy { @($livePolicy) }
+        Mock Get-MgIdentityConditionalAccessNamedLocation { @() }
+        Mock Get-MgPolicyAuthenticationStrengthPolicy { @() }
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'optional-module-failures')
+
+        & $exportScript -OutputPath $out.FullName -Csv -NoRecommendations -WarningVariable moduleWarnings
+
+        Should -Invoke Get-MgUser -Times 0
+        Should -Invoke Get-MgOrganization -Times 0
+        Should -Invoke Get-MgGroup -Times 1 -Exactly
+        @($moduleWarnings).Count | Should -Be 2
+        $csv = Get-ChildItem $out.FullName -Filter '*.csv'
+        $row = Import-Csv $csv.FullName
+        $row.'Included Users' | Should -Match $userId
+        $row.'Included Users' | Should -Match 'Resolved group'
+        $snapshot = Get-Content (Get-ChildItem $out.FullName -Filter '*_raw.json').FullName -Raw | ConvertFrom-Json
+        $snapshot.TenantName | Should -Be 'UnknownTenant'
+        @($snapshot.Lookups.Users.PSObject.Properties).Count | Should -Be 0
+        $snapshot.Lookups.Groups.$groupId | Should -Be 'Resolved group'
+    }
+
+    It 'Keeps embedded policy JSON script-safe and array-shaped for a single policy' {
+        $named = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $payload = '</script><script>window.reportInjected=true</script>'
+        $named.displayName = "Block $payload"
+        $named.description = "$payload$([char]0x2028)$([char]0x2029)"
+        $snapshot = New-TestPortableSnapshot -Policies @($named)
+        $inputPath = Join-Path $TestDrive 'script-safe-input.json'
+        $snapshot | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $inputPath
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'script-safe-output')
+        & $exportScript -RawInputFile $inputPath -OutputPath $out.FullName -Html -NoBrowser -NoRecommendations
+        $html = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
+        $html | Should -Not -Match ([regex]::Escape($payload))
+        $html | Should -Match 'window.CAExportData = \['
+        $html | Should -Match 'var arr = \['
+        $html | Should -Match '\\u003c/script\\u003e'
+        $html | Should -Match '\\u2028\\u2029'
+    }
+
+    It 'Compares displayed false session booleans consistently whether explicitly false or omitted' {
+        $policies = foreach ($index in 0..2) {
+            $item = $basePolicy | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+            $item.id = '00000000-0000-0000-0000-{0:d12}' -f $index
+            if ($index -ne 1) {
+                $item.sessionControls = @{
+                    applicationEnforcedRestrictions = @{ isEnabled = ($index -eq 2) }
+                    cloudAppSecurity = @{ isEnabled = ($index -eq 2) }
+                    disableResilienceDefaults = ($index -eq 2)
+                }
+            }
+            $item
+        }
+        $snapshot = New-TestPortableSnapshot -Policies @($policies)
+        $inputPath = Join-Path $TestDrive 'false-session-input.json'
+        $snapshot | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $inputPath
+        $out = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'false-session-output')
+        & $exportScript -RawInputFile $inputPath -OutputPath $out.FullName -Html -NoBrowser -NoRecommendations
+        $html = Get-Content -LiteralPath (Get-ChildItem $out.FullName -Filter '*.html').FullName -Raw
+        foreach ($column in @('Application Enforced Restrictions', 'Cloud App Security', 'Resilient Defaults')) {
+            $values = [regex]::Matches($html, "data-compare-field='$column' data-compare-value='([^']*)'")
+            @($values | ForEach-Object { $_.Groups[1].Value }) | Should -Be @('False', 'False', 'True')
+        }
     }
 
     It 'Derives Summary authentication counts from verified metadata for <Scenario>' -TestCases @(
@@ -1188,7 +1560,7 @@ $PSModuleAutoLoadingPreference = 'None'
         $html | Should -Match 'Not trusted'
         $html | Should -Match 'Unknown countries/regions:</strong> Excluded'
         $html | Should -Match 'clientIpAddress'
-        $html | Should -Match '<td[^>]*>Office &amp; VPN</td>'
+        $html | Should -Match "data-entity-type='locations'[^>]*>locations: Office &amp; VPN</button>"
         $html | Should -Match 'Sample user'
         $html | Should -Match 'Sample group'
         $html | Should -Match 'Global Administrator'
@@ -1196,8 +1568,8 @@ $PSModuleAutoLoadingPreference = 'None'
         $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-01'"
         $html | Should -Match "data-assessment='enforced'[^>]*id='rec-CA-05'"
         $html | Should -Match "data-assessment='needs-review'[^>]*id='rec-CA-13'"
-        $html | Should -Match ([regex]::Escape("CA Export v3.7 - $([System.Web.HttpUtility]::HtmlEncode($TenantLabel))"))
-        $html | Should -Match '<td[^>]*>deviceCodeFlow</td>'
+        $html | Should -Match ([regex]::Escape("CA Export v4.0 - $([System.Web.HttpUtility]::HtmlEncode($TenantLabel))"))
+        $html | Should -Match "data-compare-field='Authentication Flows'[^>]*>deviceCodeFlow<button"
         $html | Should -Match ([regex]::Escape("Snapshot captured: $($snapshot.CapturedAt)"))
         $html | Should -Not -Match 'not included in raw policy snapshots'
         $connectedCsv = Get-ChildItem $out.FullName -Filter '*.csv' | Where-Object Name -NotLike '*-pivot.csv'
@@ -1353,6 +1725,7 @@ Describe 'User and group enrichment' {
 
     BeforeEach {
         $script:OfflineMode = $false
+        $DirectoryModuleAvailable = $true
         $HTMLExport = $false
         $userIds = @('11111111-1111-1111-1111-111111111111')
         $groupIds = @('22222222-2222-2222-2222-222222222222')
@@ -1363,18 +1736,65 @@ Describe 'User and group enrichment' {
         Mock Get-MgRoleManagementDirectoryRoleDefinition { @() }
         Mock Get-MgIdentityConditionalAccessNamedLocation { @() }
         Mock Write-Warn {}
-    }
-
-    It 'Loads the user and group commands during default module initialization' {
-        Mock Get-PackageProvider { [pscustomobject]@{ Name = 'NuGet' } }
-        Mock Get-PSRepository { [pscustomobject]@{ InstallationPolicy = 'Trusted' } }
         Mock Get-Module { [pscustomobject]@{ Name = $Name } }
         Mock Import-Module {}
+    }
 
-        Initialize-GraphModule
+    It 'Loads only core modules during default initialization without contacting the gallery' {
+        Mock Get-PSRepository { throw 'Gallery must not be accessed' }
+        Mock Install-Module { throw 'Installation must not be attempted' }
+        Initialize-GraphModule | Should -BeTrue
+        Should -Invoke Import-Module -Times 2 -Exactly
+        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Authentication' -and $Global }
+        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Identity.SignIns' -and $Global }
+        Should -Invoke Get-PSRepository -Times 0
+        Should -Invoke Install-Module -Times 0
+    }
 
-        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
+    It 'Stops on a required module <Failure> failure with the underlying error' -TestCases @(
+        @{ Failure = 'install' }
+        @{ Failure = 'import' }
+    ) {
+        param($Failure)
+        if ($Failure -eq 'install') {
+            Mock Get-Module { @() }
+            Mock Install-Module { throw 'Invalid document element from proxy' }
+        }
+        else { Mock Import-Module { throw 'Assembly could not be loaded' } }
+        { Initialize-GraphModule } | Should -Throw '*Graph module*Required Graph collection cannot continue*'
+        Should -Invoke Write-Warn -Times 0
+    }
+
+    It 'Skips a failed optional module once without calling its per-entity lookups' {
+        $userIds += '33333333-3333-3333-3333-333333333333'
+        Mock Import-Module { throw 'Invalid document element from proxy' } -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
+        . $enrich
+        Should -Invoke Get-MgUser -Times 0
+        Should -Invoke Get-MgGroup -Times 1 -Exactly
+        Should -Invoke Write-Warn -Times 1 -Exactly -ParameterFilter {
+            $Message -like "*Microsoft.Graph.Users*Invalid document element from proxy*Optional enrichment*"
+        }
+        $UserMap.Count | Should -Be 0
+        Convert-IdListToName -List $userIds -Map $UserMap | Should -Be $userIds
+    }
+
+    It 'Does not install lookup modules for unreferenced entity types' {
+        $userIds = $groupIds = @()
+        . $enrich
+        Should -Invoke Import-Module -Times 0
+        Should -Invoke Get-MgUser -Times 0
+        Should -Invoke Get-MgGroup -Times 0
+        Should -Invoke Get-MgDirectoryRole -Times 0
+        Should -Invoke Get-MgRoleManagementDirectoryRoleDefinition -Times 0
+    }
+
+    It 'Reports optional installation failures without invoking import or abandoning other modules' {
+        Mock Get-Module { @() } -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
+        Mock Install-Module { Write-Error 'Proxy authentication required' }
+        Initialize-GraphModule -RequiredModules 'Microsoft.Graph.Users','Microsoft.Graph.Groups' -Optional | Should -BeFalse
+        Should -Invoke Import-Module -Times 0 -ParameterFilter { $Name -eq 'Microsoft.Graph.Users' }
         Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -eq 'Microsoft.Graph.Groups' }
+        Should -Invoke Write-Warn -Times 1 -Exactly -ParameterFilter { $Message -like '*Proxy authentication required*' }
     }
 
     It 'Resolves assignment IDs using live user and group lookup results' {
