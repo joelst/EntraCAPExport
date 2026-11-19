@@ -1,7 +1,9 @@
 <#
 	.SYNOPSIS
-		Conditional Access Export Utility
+		Deprecated Conditional Access Export Utility (legacy compatibility only)
 	.DESCRIPTION
+    Deprecated as of version 4.0. Use Export-CAPolicyWithRecs.ps1 instead.
+    This frozen legacy implementation is retained for existing callers and receives no new features.
     Exports CA Policy to HTML
 
 	.PARAMETER TenantID
@@ -69,6 +71,8 @@ param (
 
 # Reference parameters to satisfy analyzer usage checks
 $null = $TenantID
+
+Write-Warning 'Export-CaPolicy.ps1 is deprecated as of 4.0 and retained only for legacy compatibility. Use Export-CAPolicyWithRecs.ps1 instead (supports -TenantID and -NoRecommendations).'
 
 # UTILITY FUNCTIONS
 

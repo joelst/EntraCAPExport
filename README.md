@@ -1,13 +1,29 @@
-# Export Conditional Access Policies PowerShell Scripts
+# Export Conditional Access Policies — 4.0
 
 Export and analyze Microsoft Entra ID (Azure AD) Conditional Access (CA) policies for documentation, security review, and remediation planning.
 
-Two scripts are provided:
+`Export-CAPolicyWithRecs.ps1` is the supported exporter as of 4.0.
 
 | Script | Purpose |
 |--------|---------|
-| `Export-CaPolicy.ps1` | Lightweight export – single HTML table of policies. |
-| `Export-CAPolicyWithRecs.ps1` | Full export – identity enrichment, 32 recommendation/template assessments, Named Locations, multiple output formats, and an interactive HTML report. |
+| `Export-CAPolicyWithRecs.ps1` | Supported: identity enrichment, 32 recommendation/template assessments, naming hints, pattern comparison, offline snapshots, Named Locations, multiple output formats, and an interactive HTML report. |
+| `Export-CaPolicy.ps1` | **Deprecated in 4.0.** Frozen legacy implementation retained for existing callers; emits a deprecation warning. Use the supported exporter instead. |
+
+### Migrating from the deprecated script
+
+The legacy script is not a wrapper: its existing behavior is frozen, and it does not receive 4.0 features. Update automation to invoke `Export-CAPolicyWithRecs.ps1`; existing `-TenantID`, `-PolicyID`, `-Csv` and `-CsvPivot` parameters are supported.
+
+| Migration concern | Supported exporter behavior |
+|-------------------|-----------------------------|
+| Output formats | No format switches produces HTML, enriched JSON and CSV. Specifying formats selects only those reports; use `-Html -Csv` or `-Html -CsvPivot` if callers previously relied on HTML always being added. |
+| Raw collection | Every connected run also writes a portable `*_raw.json`, independently of report-format selection. Offline replay does not write another snapshot. |
+| Output directory | Defaults to the current directory, not the script directory. `-OutputPath` must name an existing directory. |
+| Filenames | Use the `CAExportRecs_` prefix rather than `CAExport_`; update downstream file searches. |
+| CSV schema | The flat CSV adds `Naming Hints`; use `-CsvColumns` when consumers require a fixed subset/order. Pivot CSV also includes a Naming Hints row. |
+| Graph consent | Requires `Policy.Read.All`, `Directory.Read.All` and `RoleManagement.Read.All`; do not assume the legacy permission set is sufficient. |
+| Analysis | `-NoRecommendations` skips the 32 assessments, not naming hints, enrichment or connected-run snapshot collection. |
+
+Neither script changes tenant policies. Existing portable snapshots and legacy raw policy arrays remain valid offline inputs; enriched report JSON is not an offline snapshot.
 
 ---
 ## Key Features (Full Export Script)
@@ -33,13 +49,15 @@ Two scripts are provided:
 * Preference persistence (remembers active tab, boolean mode, policy deployment filter, recommendation view and assessment filter)
 * Accessibility: keyboard‑navigable tabs, aria-live announcements (copy feedback), sticky headers, focusable controls
 * CSV (long), CSV Pivot (wide) and JSON export options
+* Naming hints flag potential name/configuration mismatches; optional suggested names never rename policies
+* Click individual assignment tokens to highlight the same entity type and original ID across includes/excludes; compare exact field values and optionally filter to matching policies
 * Deployment, authentication, device, risk, and administrator metrics in Summary
 * Optional fast mode: `-NoRecommendations` skips assessments and omits the Recommendations tab; Summary, Policy Details, and Named Locations remain available
 * Inline recommendation catalog (no external data file dependency) with escaped policy evidence
 
 ## Screenshots — sample data only
 
-These captures show version 3.7 using **Contoso Demo (sample data)**. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
+These captures show version 3.7 using **Contoso Demo (sample data)**, so they do not show the 4.0 naming hints, NON-BLOCKING labels or comparison controls. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
 
 The sample policies illustrate report behavior, **not a recommended production baseline**. Both light and dark themes are shown.
 
@@ -81,7 +99,7 @@ The sample policies illustrate report behavior, **not a recommended production b
 ---
 ## Installation / Prereqs
 
-PowerShell 7.5 + is recommended. Ensure Microsoft Graph modules are installed. You can install all of the modules using:
+PowerShell 7.5+ is recommended. Connected collection uses Microsoft Graph modules; the script attempts to install missing modules in CurrentUser scope and import them. For managed environments, preinstall the modules using your approved process. You can install the full SDK using:
 
 ```powershell
 Install-Module Microsoft.Graph -Scope CurrentUser
@@ -113,6 +131,9 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 # All formats
 ./Export-CAPolicyWithRecs.ps1 -Html -Json -Csv -CsvPivot
 
+# Select and verify a particular tenant
+./Export-CAPolicyWithRecs.ps1 -TenantID 11111111-2222-3333-4444-555555555555
+
 # Later, on another computer: copy the script and the generated *_raw.json snapshot
 ./Export-CAPolicyWithRecs.ps1 -RawInputFile .\CAExportRecs_ExampleTenant_20261118_090000_raw.json -Html -NoBrowser
 
@@ -120,7 +141,7 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 ./Export-CAPolicyWithRecs.ps1 -Html -EmergencyAccessAccountId `
   '11111111-2222-3333-4444-555555555555','66666666-7777-8888-9999-000000000000'
 
-# Single policy by Id (also export JSON)
+# Single policy by ID (enriched JSON only, plus the connected-run snapshot)
 ./Export-CAPolicyWithRecs.ps1 -PolicyID 11111111-2222-3333-4444-555555555555 -Json
 
 # Custom CSV columns
@@ -134,8 +155,8 @@ After sign-in or reconnection, the script reads the new Graph context and stops 
 ```
 
 **Output files are timestamped:**
-- Full script: `CAExportRecs_<TenantName>_YYYYMMDD_HHMMSS.*`
-- Lightweight script: `CAExport_<TenantName>_YYYYMMDD_HHMMSS.*`
+- Supported script: `CAExportRecs_<TenantName>_YYYYMMDD_HHMMSS.*`
+- Deprecated script: `CAExport_<TenantName>_YYYYMMDD_HHMMSS.*`
 
 The full script sanitizes tenant names for portable filenames; report titles and snapshot metadata retain the original tenant name.
 
@@ -144,10 +165,11 @@ The full script sanitizes tenant names for portable filenames; report titles and
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
+| `TenantID` | String (GUID) | Select a tenant for connected exports; reconnect if necessary and verify the resulting Graph tenant. Cannot be combined with `RawInputFile`. |
 | `PolicyID` | String (GUID) | Limit export to a single CA policy. |
 | `Html` | Switch | Emit interactive HTML. With no export switches, HTML, JSON, and CSV are produced. |
 | `NoBrowser` | Switch | Generate HTML without automatically launching browser. |
-| `OutputPath` | String | Custom output directory path (defaults to current directory). |
+| `OutputPath` | String | Existing output directory path (defaults to current directory). |
 | `Json` | Switch | Emit enriched policy JSON. This is not a raw Graph snapshot. |
 | `Csv` | Switch | Emit flattened CSV of policies. |
 | `CsvPivot` | Switch | Emit pivot‑friendly wide CSV. |
@@ -157,6 +179,26 @@ The full script sanitizes tenant names for portable filenames; report titles and
 | `EmergencyAccessAccountId` | String[] (GUIDs) | Explicitly designated emergency-account object IDs for exclusion review. Saved in portable snapshots and restored offline unless this parameter is supplied to override them. No account names or membership are guessed. |
 
 If no export switch is specified, HTML, JSON, and CSV are produced automatically (pivot remains opt-in).
+
+## Naming hints and pattern comparison
+
+Policy Details shows expandable **naming hints** for potential mismatches: a name claiming Block without a Block grant, a blocking policy not enabled for enforcement, Require MFA without verified mandatory MFA on every grant path, and All users without that assignment or with identity exclusions. Common camel-case and hyphen/underscore-separated tokens such as `AllUsers` and `RequireMFA` are recognized, as are Block, Blocks, Blocking and Blocked. Negated phrases such as Non-Blocking or Do not block are not themselves blocking claims. Mandatory compliance/hybrid-join grants can legitimately implement unmanaged-device restrictions without a Block grant; those recognized patterns are not flagged merely for lacking Block. These are conservative English-language heuristics, not an exhaustive naming audit or an instruction to change a policy. No hint does not certify that a name is accurate. Hints are included in enriched JSON, default CSV columns, and pivot CSV, independently of `-NoRecommendations`; a custom `-CsvColumns` selection must include `'Naming Hints'` to retain them.
+
+**Show suggested names** reveals heuristic naming suggestions; OR grant alternatives are named as alternatives, not mandatory MFA/device controls. Custom authentication factors and risk remediation have explicit grant names; unknown controls are marked for review rather than described as session-only policies. SDK metadata stored in AdditionalProperties is used for assignments and grants. Suggestions use a generated numeric prefix on each run, so they are not stable identifiers or a naming standard you must adopt. Policy IDs remain the identity for comparisons. Nothing is renamed.
+
+Non-block grant policies are labeled **NON-BLOCKING**, not ALLOW. Conditional Access does not grant access or let one policy override another policy's block.
+
+Click a user, group, role, application, or location token to highlight direct assignments with the same **entity type and original ID** throughout the policy table. Display-name duplicates do not match unless the IDs also match. Built-in selectors such as All remain selectors, not expanded membership; structured guest selectors retain their tenant restrictions when compared. Included matches have solid borders and explicit labels; excluded matches have dashed borders and explicit labels.
+
+Each comparable cell has a **Compare** button that highlights identical displayed values in that same field. Assignment cells compare sets of typed IDs regardless of display order, not flattened names. Boolean cells normalize omitted and explicit false values because both display False; use original JSON when that raw-data distinction matters. Only one entity or cell comparison is active at a time. The comparison bar reports matching-policy counts by deployment state and, for entity matches, include/exclude counts (a policy can appear in both). Counts cover this export before search/deployment filters. **Show matching policies only** combines with those filters; **Clear comparison** removes highlighting and the comparison filter.
+
+For example, to inspect an emergency-access group, click its token under Included Users or Excluded Users, read the include/exclude and deployment counts, then enable **Show matching policies only**. Add a deployment filter or search term to narrow that set. Matching a group means the group ID is directly assigned, not that any particular user is a member. To compare a whole assignment set instead, use that cell's **Compare** button; empty assignment cells can be compared too. Clearing a comparison leaves your search and deployment filters intact.
+
+All matching controls are native keyboard-focusable buttons or checkboxes. Clicking controls does not toggle the existing row selection; clicking an ordinary cell still does. Comparisons and suggested-name visibility reset when the report reloads, while the existing tab, deployment, boolean and recommendation preferences remain persistent.
+
+Searching `block` does not match the NON-BLOCKING badge, but it can still match policy names and naming hints that actually contain Block. Search `non-blocking` to find that badge explicitly. For a configuration-only comparison, use **Compare** in the Block column instead of relying on a keyword in policy text.
+
+These tools help inspect explicit overlaps and apparent gaps; they do **not** expand group/PIM membership, resolve nested/dynamic groups, combine conditional policy coverage, or prove effective-access holes. A single-policy or offline export can only compare the policies it contains.
 
 ## Named Locations
 
@@ -240,6 +282,8 @@ Microsoft guidance and prerequisite links were reviewed November 18, 2026. Licen
 
 HTML reports need no companion images, CSS, JavaScript downloads, or web server. The images in this README are documentation assets only.
 
+Policy JSON embedded in HTML is escaped for script contexts; names, IDs and deployment labels are encoded for their HTML contexts. Original and enriched JSON views also work for single-policy reports. Values are displayed as data, not interpreted as markup. Regenerate older reports with the current exporter to receive these rendering fixes.
+
 ### Collect once and report offline
 
 **On the connected computer**, run the full script once with the required Graph permissions:
@@ -277,22 +321,31 @@ Real exports and snapshots can contain sensitive identity, application, and netw
 | Named Locations unavailable offline | Use the automatically generated portable `*_raw.json`, not a legacy policy-only array. If the saved inventory reports a collection failure, resolve that error and collect a new snapshot while connected. |
 | CSV warning about `NoTypeInformation` | Use the updated full exporter, which no longer passes the obsolete parameter. CSV output still contains headers and data without type-information rows. |
 | Offline mode shows fewer enriched names | Portable snapshots restore names resolved during collection. Legacy arrays or failed lookups retain IDs; resolve collection warnings and collect again while connected. |
+| Tenant verification fails | Use the requested tenant GUID with an account that can access that tenant. The exporter stops rather than continuing against another tenant. Omit `-TenantID` for offline replay; the snapshot supplies the captured tenant. |
+| A comparison has matches but the table is empty | The comparison totals cover the export before search/deployment filters. Clear the search, select All policies, or clear the comparison to inspect the full set. |
+| Two identical names do not highlight together | Matching uses the original entity type and ID, not names. Different users/groups can share a display name; a user and a group never become equivalent merely because their names or IDs match. |
+| Naming hints seem too cautious | Expand the hint and compare it with the original policy JSON and intended scope. Hints are English-language heuristics, not effective-access findings; retain an intentional name or change it manually only after review. |
 
 ---
 ## Contributing
 
 PRs welcome. Please:
-1. Run `Invoke-Pester -Path ./tests -Output Detailed` and `Invoke-ScriptAnalyzer -Path ./Export-CAPolicyWithRecs.ps1 -Severity Error,Warning`
+1. Run `Invoke-Pester -Path ./tests -Output Detailed -CI` and `Invoke-ScriptAnalyzer -Path ./Export-CAPolicyWithRecs.ps1 -Severity Error,Warning`
 2. Keep alignment style (hash property columns) intact
 3. Add comment‑based help for any new function/parameter
 4. Update this README when adding features
 5. Use synthetic data only for documentation screenshots; never use tenant exports or sign-in/consent screenshots containing real account details
+
+For browser interaction regression tests, run `node --test tests/report-interactions.cjs`. This uses Node.js built-ins, PowerShell, and a headless Chromium-based browser with synthetic snapshots and a disposable profile; no npm packages are required. The default executable is Microsoft Edge on macOS/Windows or `/usr/bin/chromium` on Linux. Set `CA_BROWSER_PATH` to use another Edge/Chrome/Chromium executable.
+
+Pester and PSScriptAnalyzer are development dependencies, not offline-export requirements. Browser tests execute generated reports with recommendations both enabled and omitted, plus a single-policy case. They cover same-name/different-ID entities, cross-type isolation, include/exclude matching, set-order-independent cell comparison, empty/false cells, combined filters, naming disclosures, suggested-name searches, boolean-display changes, and original/enriched JSON rendering with hostile-looking synthetic text. Graph connection tests use mocks; they do not validate live tenant consent or directory-role access.
 
 ---
 ## Version History
 
 | Version | Highlights |
 |---------|-----------|
+| 4.0 | WithRecs is the supported exporter; baseline fully deprecated and retained only for legacy callers. Verified `-TenantID` selection, raw-policy naming hints and optional naming suggestions, NON-BLOCKING terminology, ID/type-based assignment highlighting, exact-cell comparison, include/exclude/deployment counts, and combined comparison/search/state filters. Review hardening adds script-safe JSON and encoded report attributes, complete single-policy JSON views, false/unset boolean comparison parity, negation-aware naming hints, SDK-aware grant suggestions and block-search corrections. |
 | 3.7 | Automatic portable offline snapshots on every connected run, including complete Named Locations, resolved names, authentication strengths, capture metadata, emergency-account IDs, and partial-export limits; backward-compatible policy-array loading and explicit snapshot validation. |
 | 3.6 | Paginated Named Locations inventory with explicit offline/failure states; post-connect scope verification; four recommendation views plus an Assessment dropdown and preference migration; improved Summary formatting; removed obsolete CSV parameter warnings. |
 | 3.5 | Fixed false restrictions from empty Graph SDK models and separated optional applicability reviews from Attention; four application-scoped templates with match/deployment measurements and resource/filter evidence; refreshed all tabs with responsive light/dark layouts, contained sticky scrolling and combined filters. |
