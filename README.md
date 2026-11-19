@@ -61,7 +61,7 @@ Neither script changes tenant policies. Existing portable snapshots and legacy r
 
 ## Screenshots — sample data only
 
-These captures were generated with the **4.0 exporter** from a synthetic **Contoso Demo (sample data)** snapshot containing 14 policies and four named locations. All tenant-specific information was generated from scratch, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
+These captures show version 3.7 using the **Contoso Demo (sample data)**. All tenant-specific information was generated from scratch with mocked Graph responses, not copied or anonymized from a real tenant. Account/group names and customer-specific IDs are fictional; network prefixes are reserved documentation ranges. Built-in Microsoft resource/role identifiers are public constants.
 
 The sample policies illustrate report behavior, **not a recommended production baseline**. Both light and dark themes are shown.
 
